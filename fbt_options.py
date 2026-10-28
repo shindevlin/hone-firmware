@@ -64,9 +64,11 @@ FIRMWARE_APPS = {
     "default": [
         # Svc
         "basic_services",
-        # Apps
-        "main_apps",
-        "system_apps",
+        # HONE owns every sensor. No Sub-GHz/NFC/RFID/iButton/IR/JS apps.
+        "hone",
+        "updater_app",
+        "gpio",
+        "archive",
         # Settings
         "settings_apps",
     ],
