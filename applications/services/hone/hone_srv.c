@@ -18,7 +18,6 @@
 
 #include <furi.h>
 #include <furi_hal_subghz.h>
-#include <furi_hal_region.h>
 #include <furi_hal_power.h>
 #include <storage/storage.h>
 #include <string.h>
@@ -40,8 +39,9 @@
 #define HONE_SLOT_MS      2000u          /* capture window per slot */
 #define HONE_RSSI_GAP_MS  50u            /* RSSI sample spacing inside window */
 
-/* Sub-GHz observation frequencies, first one allowed by region wins. */
-static const uint32_t hone_subghz_freqs[] = {433920000UL, 915000000UL, 868350000UL};
+/* Sub-GHz observation frequencies, one per Sub-GHz slot in rotation.
+ * Receive only, so region does not apply (region limits TX, checked at TX). */
+static const uint32_t hone_subghz_freqs[] = {433920000UL, 315000000UL, 915000000UL, 868350000UL};
 
 typedef struct {
     Storage* storage;
@@ -124,14 +124,9 @@ static void queue_append(HoneSrv* s, const uint8_t* frame, size_t len) {
 /* ─── sensors: each one acquires and fully releases its hardware ───────── */
 
 static bool capture_subghz(HoneBodySubGhz* out) {
-    uint32_t freq = 0;
-    for(size_t i = 0; i < COUNT_OF(hone_subghz_freqs); i++) {
-        if(furi_hal_region_is_frequency_allowed(hone_subghz_freqs[i])) {
-            freq = hone_subghz_freqs[i];
-            break;
-        }
-    }
-    if(!freq) return false; /* region not provisioned or nothing allowed */
+    static size_t next = 0;
+    uint32_t freq = hone_subghz_freqs[next++ % COUNT_OF(hone_subghz_freqs)];
+    if(!furi_hal_subghz_is_frequency_valid(freq)) return false;
 
     furi_hal_subghz_reset();
     furi_hal_subghz_idle();
