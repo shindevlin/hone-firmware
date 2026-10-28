@@ -20,6 +20,7 @@ static HoneSensorClass class_of(HoneSensorKind k) {
     case HoneSensorNfc:       return HoneClassEvent;
     case HoneSensorRfid:      return HoneClassEvent;
     case HoneSensorIButton:   return HoneClassEvent;
+    case HoneSensorIr:        return HoneClassEvent;
     case HoneSensorHeartbeat: return HoneClassHousekeeping;
     default:                   return HoneClassContinuous;
     }

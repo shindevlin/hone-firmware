@@ -67,7 +67,29 @@ typedef struct __attribute__((packed)) {
     uint32_t uptime_s;
     uint32_t total_frames;
     char     fw[8];
+    uint16_t battery_mv;   /* fuel gauge */
+    int16_t  battery_ma;   /* fuel gauge, negative = discharging */
+    int8_t   battery_c;    /* fuel gauge temperature, deg C */
 } HoneBodyHeartbeat;
+
+/* NFC / 125 kHz RFID / iButton. The raw ID is never published: id_hash is
+ * sha256(device pubkey || "hone-tag" || type || protocol || raw id)[0..16].
+ * Same Flipper + same tag = same hash; different Flippers cannot link it. */
+typedef struct __attribute__((packed)) {
+    uint8_t protocol;     /* library protocol id */
+    uint8_t id_len;       /* raw id length (0 if none read) */
+    uint8_t id_hash[16];
+    uint8_t extra[3];     /* NFC-A: atqa[2], sak. else 0 */
+} HoneBodyTag;
+
+/* IR. Remote codes are not personal, so decoded signals go out as-is. */
+typedef struct __attribute__((packed)) {
+    int8_t   protocol;    /* InfraredProtocol, -1 = undecoded/raw */
+    uint8_t  repeat;
+    uint32_t address;
+    uint32_t command;
+    uint16_t raw_timings; /* timing count when undecoded */
+} HoneBodyIr;
 
 /* Build + sign a frame into out (>= HONE_FRAME_MAX). Returns total length. */
 size_t hone_frame_build(

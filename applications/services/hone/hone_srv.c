@@ -22,6 +22,18 @@
 #include <storage/storage.h>
 #include <string.h>
 
+#include <nfc/nfc.h>
+#include <nfc/nfc_scanner.h>
+#include <nfc/protocols/nfc_protocol.h>
+#include <nfc/protocols/iso14443_3a/iso14443_3a_poller_sync.h>
+#include <lfrfid/lfrfid_worker.h>
+#include <lfrfid/protocols/lfrfid_protocols.h>
+#include <toolbox/protocols/protocol_dict.h>
+#include <ibutton/ibutton_worker.h>
+#include <ibutton/ibutton_protocols.h>
+#include <infrared_worker.h>
+#include <mbedtls/sha256.h>
+
 #define TAG "HoneSrv"
 #define HONE_FW_VERSION "2.0.0"
 
@@ -157,6 +169,185 @@ static bool capture_subghz(HoneBodySubGhz* out) {
     return true;
 }
 
+/* ─── tag sensors: wait on a library callback for up to one slot window ─── */
+
+typedef struct {
+    FuriSemaphore* done;
+    volatile bool hit;
+    uint32_t id;            /* protocol id (RFID/NFC) */
+    HoneBodyIr ir;
+} HoneWait;
+
+static bool wait_slot(HoneWait* w) {
+    return furi_semaphore_acquire(w->done, furi_ms_to_ticks(HONE_SLOT_MS)) == FuriStatusOk;
+}
+
+static void signal_once(HoneWait* w) {
+    if(!w->hit) {
+        w->hit = true;
+        furi_semaphore_release(w->done);
+    }
+}
+
+/* id_hash = sha256(pk || "hone-tag" || type || protocol || raw)[0..16] */
+static void tag_hash(
+    const HoneSrv* s,
+    uint8_t type,
+    uint8_t protocol,
+    const uint8_t* raw,
+    size_t len,
+    uint8_t out[16]) {
+    mbedtls_sha256_context c;
+    uint8_t d[32];
+    mbedtls_sha256_init(&c);
+    mbedtls_sha256_starts(&c, 0);
+    mbedtls_sha256_update(&c, s->pk, 32);
+    mbedtls_sha256_update(&c, (const uint8_t*)"hone-tag", 8);
+    mbedtls_sha256_update(&c, &type, 1);
+    mbedtls_sha256_update(&c, &protocol, 1);
+    mbedtls_sha256_update(&c, raw, len);
+    mbedtls_sha256_finish(&c, d);
+    mbedtls_sha256_free(&c);
+    memcpy(out, d, 16);
+}
+
+static void nfc_scan_cb(NfcScannerEvent event, void* ctx) {
+    HoneWait* w = ctx;
+    if(event.type == NfcScannerEventTypeDetected && event.data.protocol_num > 0) {
+        w->id = event.data.protocols[0];
+        signal_once(w);
+    }
+}
+
+static bool capture_nfc(HoneSrv* s, HoneBodyTag* out) {
+    HoneWait w = {.done = furi_semaphore_alloc(1, 0)};
+    Nfc* nfc = nfc_alloc();
+    NfcScanner* sc = nfc_scanner_alloc(nfc);
+    nfc_scanner_start(sc, nfc_scan_cb, &w);
+    bool got = wait_slot(&w);
+    nfc_scanner_stop(sc);
+    nfc_scanner_free(sc);
+
+    if(got) {
+        memset(out, 0, sizeof(*out));
+        out->protocol = (uint8_t)w.id;
+        /* UID for the ISO14443-3A family (MIFARE, NTAG, most bank/transit cards). */
+        if(w.id == NfcProtocolIso14443_3a || nfc_protocol_has_parent(w.id, NfcProtocolIso14443_3a)) {
+            Iso14443_3aData d = {0};
+            if(iso14443_3a_poller_sync_read(nfc, &d) == Iso14443_3aErrorNone && d.uid_len) {
+                out->id_len = d.uid_len;
+                tag_hash(s, HoneMsgNfc, out->protocol, d.uid, d.uid_len, out->id_hash);
+                out->extra[0] = d.atqa[0];
+                out->extra[1] = d.atqa[1];
+                out->extra[2] = d.sak;
+            }
+        }
+    }
+    nfc_free(nfc); /* releases the NFC chip */
+    furi_semaphore_free(w.done);
+    return got;
+}
+
+static void rfid_cb(LFRFIDWorkerReadResult result, ProtocolId protocol, void* ctx) {
+    HoneWait* w = ctx;
+    if(result == LFRFIDWorkerReadDone) {
+        w->id = protocol;
+        signal_once(w);
+    }
+}
+
+static bool capture_rfid(HoneSrv* s, HoneBodyTag* out) {
+    HoneWait w = {.done = furi_semaphore_alloc(1, 0)};
+    ProtocolDict* dict = protocol_dict_alloc(lfrfid_protocols, LFRFIDProtocolMax);
+    LFRFIDWorker* worker = lfrfid_worker_alloc(dict);
+    lfrfid_worker_start_thread(worker);
+    lfrfid_worker_read_start(worker, LFRFIDWorkerReadTypeAuto, rfid_cb, &w);
+    bool got = wait_slot(&w);
+    lfrfid_worker_stop(worker);
+    lfrfid_worker_stop_thread(worker);
+
+    if(got) {
+        uint8_t raw[32];
+        size_t n = protocol_dict_get_data_size(dict, w.id);
+        if(n > sizeof(raw)) n = sizeof(raw);
+        protocol_dict_get_data(dict, w.id, raw, n);
+        memset(out, 0, sizeof(*out));
+        out->protocol = (uint8_t)w.id;
+        out->id_len = (uint8_t)n;
+        tag_hash(s, HoneMsgRfid, out->protocol, raw, n, out->id_hash);
+    }
+    lfrfid_worker_free(worker);
+    protocol_dict_free(dict);
+    furi_semaphore_free(w.done);
+    return got;
+}
+
+static void ibutton_cb(void* ctx) {
+    signal_once(ctx);
+}
+
+static bool capture_ibutton(HoneSrv* s, HoneBodyTag* out) {
+    HoneWait w = {.done = furi_semaphore_alloc(1, 0)};
+    iButtonProtocols* protocols = ibutton_protocols_alloc();
+    iButtonKey* key = ibutton_key_alloc(ibutton_protocols_get_max_data_size(protocols));
+    iButtonWorker* worker = ibutton_worker_alloc(protocols);
+    ibutton_worker_start_thread(worker);
+    ibutton_worker_read_set_callback(worker, ibutton_cb, &w);
+    ibutton_worker_read_start(worker, key);
+    bool got = wait_slot(&w);
+    ibutton_worker_stop(worker);
+    ibutton_worker_stop_thread(worker);
+
+    if(got) {
+        iButtonEditableData ed;
+        ibutton_protocols_get_editable_data(protocols, key, &ed);
+        memset(out, 0, sizeof(*out));
+        out->protocol = (uint8_t)ibutton_key_get_protocol_id(key);
+        out->id_len = (uint8_t)MIN(ed.size, 255u);
+        tag_hash(s, HoneMsgIButton, out->protocol, ed.ptr, ed.size, out->id_hash);
+    }
+    ibutton_worker_free(worker);
+    ibutton_key_free(key);
+    ibutton_protocols_free(protocols);
+    furi_semaphore_free(w.done);
+    return got;
+}
+
+static void ir_cb(void* ctx, InfraredWorkerSignal* sig) {
+    HoneWait* w = ctx;
+    if(w->hit) return;
+    memset(&w->ir, 0, sizeof(w->ir));
+    if(infrared_worker_signal_is_decoded(sig)) {
+        const InfraredMessage* m = infrared_worker_get_decoded_signal(sig);
+        w->ir.protocol = (int8_t)m->protocol;
+        w->ir.address = m->address;
+        w->ir.command = m->command;
+        w->ir.repeat = m->repeat;
+    } else {
+        const uint32_t* t;
+        size_t n;
+        infrared_worker_get_raw_signal(sig, &t, &n);
+        w->ir.protocol = -1;
+        w->ir.raw_timings = (uint16_t)MIN(n, 0xFFFFu);
+    }
+    signal_once(w);
+}
+
+static bool capture_ir(HoneBodyIr* out) {
+    HoneWait w = {.done = furi_semaphore_alloc(1, 0)};
+    InfraredWorker* worker = infrared_worker_alloc();
+    infrared_worker_rx_enable_signal_decoding(worker, true);
+    infrared_worker_rx_enable_blink_on_receiving(worker, false);
+    infrared_worker_rx_set_received_signal_callback(worker, ir_cb, &w);
+    infrared_worker_rx_start(worker);
+    bool got = wait_slot(&w);
+    infrared_worker_rx_stop(worker);
+    infrared_worker_free(worker);
+    if(got) *out = w.ir;
+    furi_semaphore_free(w.done);
+    return got;
+}
+
 static void emit(HoneSrv* s, HoneMsgType type, const void* body, uint8_t body_len) {
     size_t len = hone_frame_build(
         s->frame, type, body, body_len, s->pk, s->sk, counter_next(s), s->anchor);
@@ -180,6 +371,9 @@ static bool run_slot(HoneSrv* s, HoneSensorKind k) {
             .battery_pct = furi_hal_power_get_pct(),
             .uptime_s = furi_get_tick() / furi_kernel_get_tick_frequency(),
             .total_frames = s->total_frames,
+            .battery_mv = (uint16_t)(furi_hal_power_get_battery_voltage(FuriHalPowerICFuelGauge) * 1000),
+            .battery_ma = (int16_t)(furi_hal_power_get_battery_current(FuriHalPowerICFuelGauge) * 1000),
+            .battery_c = (int8_t)furi_hal_power_get_battery_temperature(FuriHalPowerICFuelGauge),
         };
         strncpy(b.fw, HONE_FW_VERSION, sizeof(b.fw));
         emit(s, HoneMsgHeartbeat, &b, sizeof(b));
@@ -188,9 +382,25 @@ static bool run_slot(HoneSrv* s, HoneSensorKind k) {
     }
     case HoneSensorNfc:
     case HoneSensorRfid:
-    case HoneSensorIButton:
+    case HoneSensorIButton: {
+        HoneBodyTag b;
+        bool got = k == HoneSensorNfc  ? capture_nfc(s, &b) :
+                   k == HoneSensorRfid ? capture_rfid(s, &b) :
+                                         capture_ibutton(s, &b);
+        if(!got) return false;
+        HoneMsgType t = k == HoneSensorNfc ? HoneMsgNfc : k == HoneSensorRfid ? HoneMsgRfid : HoneMsgIButton;
+        emit(s, t, &b, sizeof(b));
+        FURI_LOG_I(TAG, "tag type %d proto %u idlen %u", t, b.protocol, b.id_len);
+        return true;
+    }
+    case HoneSensorIr: {
+        HoneBodyIr b;
+        if(!capture_ir(&b)) return false;
+        emit(s, HoneMsgIr, &b, sizeof(b));
+        FURI_LOG_I(TAG, "ir proto %d addr %lx cmd %lx", b.protocol, b.address, b.command);
+        return true;
+    }
     default:
-        /* Not wired yet: report barren so the scheduler backs off. */
         return false;
     }
 }
