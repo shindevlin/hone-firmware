@@ -27,7 +27,7 @@ size_t hone_frame_build(
         .body_len = body_len,
         .counter = counter,
         .rtc_unix = furi_hal_rtc_get_timestamp(),
-        .uptime_ms = furi_get_tick() * 1000 / furi_kernel_get_tick_frequency(),
+        .uptime_ms = (uint32_t)((uint64_t)furi_get_tick() * 1000 / furi_kernel_get_tick_frequency()),
     };
     memcpy(hdr.device_id, pk, HONE_DEVICE_ID_LEN);
     if(anchor) memcpy(hdr.anchor, anchor, HONE_ANCHOR_LEN);
