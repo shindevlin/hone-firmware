@@ -358,6 +358,8 @@ static bool capture_ir(HoneBodyIr* out) {
 #define HONE_WIFI_BAUD    230400
 #define HONE_WIFI_BOOT_MS 4000
 #define HONE_WIFI_SCAN_MS 10000
+#define HONE_WIFI_EVERY_MS 60000 /* on battery: at most one scan a minute (board draws 5 V) */
+#define HONE_EXT_POWER_V   4.5f  /* VBUS above this = USB/external power: scan continuously */
 
 static void wifi_rx_cb(FuriHalSerialHandle* h, FuriHalSerialRxEvent ev, void* ctx) {
     if(ev & FuriHalSerialRxEventData) {
@@ -507,8 +509,16 @@ static bool run_slot(HoneSrv* s, HoneSensorKind k) {
         return true;
     }
     case HoneSensorWifi: {
+        static uint32_t last_wifi = 0;
+        /* Read VBUS while our 5 V output is off, so it reflects real external power. */
+        bool external = !furi_hal_power_is_otg_enabled() &&
+                        furi_hal_power_get_usb_voltage() > HONE_EXT_POWER_V;
+        if(!external && last_wifi &&
+           furi_get_tick() - last_wifi < furi_ms_to_ticks(HONE_WIFI_EVERY_MS))
+            return false; /* on battery and too soon: skip without powering the board */
         HoneBodyWifi b;
         if(!capture_wifi(&b)) return false;
+        last_wifi = furi_get_tick();
         emit(s, HoneMsgWifi, &b, sizeof(b));
         FURI_LOG_I(TAG, "wifi aps %u best %d probes %u", b.aps, b.best_rssi, b.probes);
         return true;
