@@ -19,6 +19,7 @@
 #include <furi.h>
 #include <furi_hal_subghz.h>
 #include <furi_hal_power.h>
+#include <furi_hal_adc.h>
 #include <storage/storage.h>
 #include <string.h>
 
@@ -376,6 +377,13 @@ static bool run_slot(HoneSrv* s, HoneSensorKind k) {
             .battery_c = (int8_t)furi_hal_power_get_battery_temperature(FuriHalPowerICFuelGauge),
         };
         strncpy(b.fw, HONE_FW_VERSION, sizeof(b.fw));
+        FuriHalAdcHandle* adc = furi_hal_adc_acquire();
+        furi_hal_adc_configure(adc);
+        b.mcu_c10 = (int16_t)(furi_hal_adc_convert_temp(
+                                  adc, furi_hal_adc_read(adc, FuriHalAdcChannelTEMPSENSOR)) * 10);
+        b.vdda_mv = (uint16_t)furi_hal_adc_convert_vref(
+            adc, furi_hal_adc_read(adc, FuriHalAdcChannelVREFINT));
+        furi_hal_adc_release(adc);
         emit(s, HoneMsgHeartbeat, &b, sizeof(b));
         FURI_LOG_I(TAG, "heartbeat batt %u frames %lu", b.battery_pct, b.total_frames);
         return true;
