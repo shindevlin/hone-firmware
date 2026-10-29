@@ -71,7 +71,6 @@ typedef struct __attribute__((packed)) {
     int16_t  battery_ma;   /* fuel gauge, negative = discharging */
     int8_t   battery_c;    /* fuel gauge temperature, deg C */
     int16_t  mcu_c10;      /* STM32 die temperature, 0.1 deg C (1 deg resolution) */
-    uint16_t vdda_mv;      /* STM32 analog supply (from VREFINT), mV */
 } HoneBodyHeartbeat;
 
 /* NFC / 125 kHz RFID / iButton. The raw ID is never published: id_hash is
