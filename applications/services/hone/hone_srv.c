@@ -61,6 +61,7 @@
 #define HONE_QUEUE_PATH  HONE_DIR "/queue.bin"
 #define HONE_QUEUE_OLD   HONE_DIR "/queue.old"
 #define HONE_MAINT_PATH  HONE_DIR "/maintenance"
+#define HONE_OWNER_PATH  HONE_DIR "/owner.txt" /* chain account name, set at claim */
 
 #define HONE_CTR_RESERVE  1000u          /* counter block persisted ahead */
 #define HONE_QUEUE_MAX    (1024u * 1024u) /* rotate queue at 1 MB */
@@ -85,6 +86,7 @@ typedef struct {
     volatile bool paused;   /* maintenance mode, refreshed by the tag lane */
     volatile bool ext_power;        /* last VBUS reading, taken with 5 V out off */
     volatile uint32_t wifi_ok_tick; /* last time the dev board answered */
+    char owner[16];                 /* from owner.txt, NUL-padded */
 } HoneSrv;
 
 /* ─── storage helpers ───────────────────────────────────────────────────── */
@@ -116,6 +118,25 @@ static void identity_load_or_create(HoneSrv* s) {
     hone_ed25519_keypair(s->pk, s->sk);
     write_file(s->storage, HONE_KEY_PATH, s->sk, 64);
     write_file(s->storage, HONE_PUB_PATH, s->pk, 32);
+}
+
+static void owner_load(HoneSrv* s) {
+    char buf[32] = {0};
+    File* f = storage_file_alloc(s->storage);
+    size_t n = 0;
+    if(storage_file_open(f, HONE_OWNER_PATH, FSAM_READ, FSOM_OPEN_EXISTING))
+        n = storage_file_read(f, buf, sizeof(buf) - 1);
+    storage_file_close(f);
+    storage_file_free(f);
+    char next[sizeof(s->owner)] = {0};
+    for(size_t i = 0, j = 0; i < n && j < sizeof(next); i++) {
+        char c = buf[i];
+        if(c == '\n' || c == '\r' || c == ' ') break;
+        next[j++] = c;
+    }
+    /* only touch the shared copy on change, so the announce lane never
+     * catches it half-written in the normal case */
+    if(memcmp(next, s->owner, sizeof(next)) != 0) memcpy(s->owner, next, sizeof(next));
 }
 
 /* Counter: persist a ceiling ahead of use so a crash/reboot can only skip
@@ -628,6 +649,7 @@ static size_t build_announce(HoneSrv* s, uint8_t* out) {
         .battery_pct = furi_hal_power_get_pct(),
     };
     memcpy(b.pubkey, s->pk, 32);
+    memcpy(b.owner, s->owner, sizeof(b.owner));
     if(s->wifi_ok_tick && furi_get_tick() - s->wifi_ok_tick < furi_ms_to_ticks(5 * 60000))
         b.caps |= HONE_CAP_WIFI;
     if(s->ext_power) b.flags |= HONE_FLAG_EXT_POWER;
@@ -722,6 +744,7 @@ int32_t hone_srv(void* p) {
     identity_load_or_create(s);
     counter_load(s);
     read_file(s->storage, HONE_ANCHOR_PATH, s->anchor, HONE_ANCHOR_LEN);
+    owner_load(s);
     hone_sched_init(&s->sched);
     hone_sched_set_enabled(&s->sched, HoneSensorSubGhz, false); /* own lane */
     hone_sched_set_enabled(&s->sched, HoneSensorWifi, false);   /* own lane */
@@ -742,6 +765,7 @@ int32_t hone_srv(void* p) {
     while(1) {
         if(furi_get_tick() - last_maint_check > furi_ms_to_ticks(5000)) {
             s->paused = storage_file_exists(s->storage, HONE_MAINT_PATH);
+            owner_load(s); /* picks up a claim without a reboot */
             last_maint_check = furi_get_tick();
         }
         if(s->paused) {

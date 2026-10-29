@@ -28,7 +28,7 @@
 #define HONE_DEVICE_ID_LEN 8
 #define HONE_ANCHOR_LEN  8
 #define HONE_SIG_LEN     64
-#define HONE_MAX_BODY    48
+#define HONE_MAX_BODY    64
 
 typedef enum {
     HoneMsgSubGhz    = 0x01,
@@ -120,7 +120,9 @@ typedef struct __attribute__((packed)) {
     uint32_t last_counter; /* newest reading counter in the queue */
     uint8_t  battery_pct;
     uint8_t  flags;
-} HoneBodyAnnounce; /* 40 bytes */
+    char     owner[16];    /* chain account this device is registered to, NUL-padded;
+                              receivers confirm it against SensorRegister on chain */
+} HoneBodyAnnounce; /* 56 bytes */
 
 /* Build + sign a frame into out (>= HONE_FRAME_MAX). Returns total length. */
 size_t hone_frame_build(
