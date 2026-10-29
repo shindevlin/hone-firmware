@@ -56,6 +56,7 @@ typedef struct {
     uint32_t epoch_yield;    /* successful captures this epoch            */
     uint32_t total_yield;    /* successful captures since boot            */
     uint32_t attempts;       /* attempts since boot                      */
+    bool     disabled;       /* run by its own lane, not this rotation    */
 } HoneSensorState;
 
 typedef struct {
@@ -98,6 +99,10 @@ void hone_sched_report(HoneScheduler* s, HoneSensorKind kind, bool found);
  * Scales up as battery drops so a low Flipper sips power.
  */
 uint32_t hone_sched_cycle_delay_ms(const HoneScheduler* s);
+
+/* Take a sensor out of (or back into) this rotation, e.g. when it runs on
+ * its own dedicated lane/thread. Heartbeat cannot be disabled. */
+void hone_sched_set_enabled(HoneScheduler* s, HoneSensorKind kind, bool enabled);
 
 /* True if `kind` has hit its per-epoch economic cap (event sensors only). */
 bool hone_sched_at_cap(const HoneScheduler* s, HoneSensorKind kind);

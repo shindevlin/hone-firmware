@@ -36,6 +36,7 @@ void hone_sched_init(HoneScheduler* s) {
         s->sensors[i].epoch_yield    = 0;
         s->sensors[i].total_yield    = 0;
         s->sensors[i].attempts       = 0;
+        s->sensors[i].disabled       = false;
     }
     s->cycle           = 0;
     s->heartbeat_every = HONE_HEARTBEAT_EVERY;
@@ -62,6 +63,11 @@ void hone_sched_set_battery(HoneScheduler* s, uint8_t pct) {
     s->battery_pct = pct > 100 ? 100 : pct;
 }
 
+void hone_sched_set_enabled(HoneScheduler* s, HoneSensorKind kind, bool enabled) {
+    if(!s || kind >= HoneSensorCount || kind == HoneSensorHeartbeat) return;
+    s->sensors[kind].disabled = !enabled;
+}
+
 bool hone_sched_at_cap(const HoneScheduler* s, HoneSensorKind kind) {
     if(!s || kind >= HoneSensorCount) return false;
     const HoneSensorState* st = &s->sensors[kind];
@@ -76,6 +82,7 @@ static bool eligible(const HoneScheduler* s, HoneSensorKind k) {
         /* Housekeeping runs on a fixed slow cadence, ignores yield. */
         return (s->cycle % s->heartbeat_every) == 0;
     }
+    if(st->disabled) return false;            /* runs on its own lane */
     if(hone_sched_at_cap(s, k)) return false; /* economically pointless now */
     return st->skip_remaining == 0;
 }
@@ -107,11 +114,12 @@ HoneSensorKind hone_sched_next(HoneScheduler* s) {
     /* Everything is backed off or capped. Return the non-heartbeat sensor
      * with the fewest skip cycles remaining so the loop still makes progress
      * (prefer one that isn't hard-capped this epoch). */
-    HoneSensorKind best = HoneSensorSubGhz;
+    HoneSensorKind best = HoneSensorHeartbeat; /* if nothing else is enabled */
     uint32_t best_skip = 0xFFFFFFFFu;
     for(size_t i = 0; i < HoneSensorCount; i++) {
         HoneSensorKind k = (HoneSensorKind)i;
         if(k == HoneSensorHeartbeat) continue;
+        if(s->sensors[i].disabled) continue;
         if(hone_sched_at_cap(s, k)) continue;
         if(s->sensors[i].skip_remaining < best_skip) {
             best_skip = s->sensors[i].skip_remaining;

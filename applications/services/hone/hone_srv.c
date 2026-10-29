@@ -1,8 +1,16 @@
 /*
  * hone_srv.c — HONE sensor service (firmware-resident, starts at boot)
  *
- * HONE is the only owner of the Flipper's sensors. This service runs on its own
- * thread with its own stack and rotates through the sensors in timed slots.
+ * HONE is the only owner of the Flipper's sensors. Three lanes, each its own
+ * thread and stack:
+ *   - Sub-GHz lane: continuous RSSI windows (SPI only, no timers)
+ *   - Wi-Fi lane: dev board scans (separate MCU on USART), continuous on
+ *     external power, once a minute on battery
+ *   - tag lane (service thread): rotates NFC (+IR), iButton (+IR), RFID, IR,
+ *     heartbeat. NFC and iButton both need TIM1 and RFID needs TIM1+TIM2, so
+ *     only one of them runs at a time; IR receive (TIM2 only) rides along
+ *     with NFC and iButton.
+ * Signing + queueing is serialised by one mutex.
  * Each slot: power the sensor up, capture for a window, power it fully down,
  * THEN sign and queue. A radio is never held while signing, and only one
  * sensor is ever powered at a time. No timer callbacks do work.
@@ -70,6 +78,8 @@ typedef struct {
     uint32_t total_frames;
     HoneScheduler sched;
     uint8_t frame[HONE_FRAME_MAX];
+    FuriMutex* emit_lock;   /* counter, frame buffer, queue file */
+    volatile bool paused;   /* maintenance mode, refreshed by the tag lane */
 } HoneSrv;
 
 /* ─── storage helpers ───────────────────────────────────────────────────── */
@@ -353,6 +363,30 @@ static bool capture_ir(HoneBodyIr* out) {
     return got;
 }
 
+/* IR running alongside an NFC or iButton window (IR RX uses TIM2 only). */
+typedef struct {
+    InfraredWorker* worker;
+    HoneWait w;
+} HoneIrRun;
+
+static void ir_begin(HoneIrRun* r) {
+    r->w = (HoneWait){.done = furi_semaphore_alloc(1, 0)};
+    r->worker = infrared_worker_alloc();
+    infrared_worker_rx_enable_signal_decoding(r->worker, true);
+    infrared_worker_rx_enable_blink_on_receiving(r->worker, false);
+    infrared_worker_rx_set_received_signal_callback(r->worker, ir_cb, &r->w);
+    infrared_worker_rx_start(r->worker);
+}
+
+static bool ir_end(HoneIrRun* r, HoneBodyIr* out) {
+    infrared_worker_rx_stop(r->worker);
+    infrared_worker_free(r->worker);
+    bool got = r->w.hit;
+    if(got) *out = r->w.ir;
+    furi_semaphore_free(r->w.done);
+    return got;
+}
+
 /* ─── Wi-Fi dev board (hone-esp on ESP32-S2, USART pins 13/14) ─────────── */
 
 #define HONE_WIFI_BAUD    230400
@@ -452,23 +486,19 @@ static bool capture_wifi(HoneBodyWifi* out) {
 }
 
 static void emit(HoneSrv* s, HoneMsgType type, const void* body, uint8_t body_len) {
+    furi_check(furi_mutex_acquire(s->emit_lock, FuriWaitForever) == FuriStatusOk);
     size_t len = hone_frame_build(
         s->frame, type, body, body_len, s->pk, s->sk, counter_next(s), s->anchor);
-    if(!len) return;
-    queue_append(s, s->frame, len);
-    s->total_frames++;
+    if(len) {
+        queue_append(s, s->frame, len);
+        s->total_frames++;
+    }
+    furi_mutex_release(s->emit_lock);
 }
 
 /* Run one slot. Returns true if the sensor produced a reading. */
 static bool run_slot(HoneSrv* s, HoneSensorKind k) {
     switch(k) {
-    case HoneSensorSubGhz: {
-        HoneBodySubGhz b;
-        if(!capture_subghz(&b)) return false;
-        emit(s, HoneMsgSubGhz, &b, sizeof(b));
-        FURI_LOG_I(TAG, "subghz %lu peak %d avg %d", b.freq_hz, b.rssi_peak_dbm, b.rssi_avg_dbm);
-        return true;
-    }
     case HoneSensorHeartbeat: {
         HoneBodyHeartbeat b = {
             .battery_pct = furi_hal_power_get_pct(),
@@ -491,10 +521,21 @@ static bool run_slot(HoneSrv* s, HoneSensorKind k) {
     case HoneSensorNfc:
     case HoneSensorRfid:
     case HoneSensorIButton: {
+        /* RFID needs TIM2 too, so IR only rides along with NFC and iButton. */
+        bool with_ir = k != HoneSensorRfid;
+        HoneIrRun ir;
+        if(with_ir) ir_begin(&ir);
         HoneBodyTag b;
         bool got = k == HoneSensorNfc  ? capture_nfc(s, &b) :
                    k == HoneSensorRfid ? capture_rfid(s, &b) :
                                          capture_ibutton(s, &b);
+        if(with_ir) {
+            HoneBodyIr irb;
+            if(ir_end(&ir, &irb)) {
+                emit(s, HoneMsgIr, &irb, sizeof(irb));
+                FURI_LOG_I(TAG, "ir proto %d addr %lx cmd %lx", irb.protocol, irb.address, irb.command);
+            }
+        }
         if(!got) return false;
         HoneMsgType t = k == HoneSensorNfc ? HoneMsgNfc : k == HoneSensorRfid ? HoneMsgRfid : HoneMsgIButton;
         emit(s, t, &b, sizeof(b));
@@ -508,24 +549,65 @@ static bool run_slot(HoneSrv* s, HoneSensorKind k) {
         FURI_LOG_I(TAG, "ir proto %d addr %lx cmd %lx", b.protocol, b.address, b.command);
         return true;
     }
-    case HoneSensorWifi: {
-        static uint32_t last_wifi = 0;
-        /* Read VBUS while our 5 V output is off, so it reflects real external power. */
-        bool external = !furi_hal_power_is_otg_enabled() &&
-                        furi_hal_power_get_usb_voltage() > HONE_EXT_POWER_V;
-        if(!external && last_wifi &&
-           furi_get_tick() - last_wifi < furi_ms_to_ticks(HONE_WIFI_EVERY_MS))
-            return false; /* on battery and too soon: skip without powering the board */
-        HoneBodyWifi b;
-        if(!capture_wifi(&b)) return false;
-        last_wifi = furi_get_tick();
-        emit(s, HoneMsgWifi, &b, sizeof(b));
-        FURI_LOG_I(TAG, "wifi aps %u best %d probes %u", b.aps, b.best_rssi, b.probes);
-        return true;
-    }
     default:
         return false;
     }
+}
+
+/* ─── lanes ─────────────────────────────────────────────────────────────── */
+
+#define HONE_LANE_STACK      (6 * 1024) /* ed25519 sign needs ~3 KB */
+#define HONE_WIFI_RETRY_MS   15000      /* no board answering: try again later */
+
+static int32_t subghz_lane(void* ctx) {
+    HoneSrv* s = ctx;
+    while(1) {
+        if(s->paused) {
+            furi_delay_ms(1000);
+            continue;
+        }
+        HoneBodySubGhz b;
+        if(capture_subghz(&b)) {
+            emit(s, HoneMsgSubGhz, &b, sizeof(b));
+            FURI_LOG_D(TAG, "subghz %lu peak %d avg %d", b.freq_hz, b.rssi_peak_dbm, b.rssi_avg_dbm);
+        } else {
+            furi_delay_ms(1000);
+        }
+    }
+    return 0;
+}
+
+static int32_t wifi_lane(void* ctx) {
+    HoneSrv* s = ctx;
+    uint32_t last = 0;
+    while(1) {
+        if(s->paused) {
+            furi_delay_ms(1000);
+            continue;
+        }
+        /* Read VBUS while our 5 V output is off, so it reflects real external power. */
+        bool external = !furi_hal_power_is_otg_enabled() &&
+                        furi_hal_power_get_usb_voltage() > HONE_EXT_POWER_V;
+        if(!external && last && furi_get_tick() - last < furi_ms_to_ticks(HONE_WIFI_EVERY_MS)) {
+            furi_delay_ms(1000); /* on battery: at most one scan a minute */
+            continue;
+        }
+        HoneBodyWifi b;
+        if(capture_wifi(&b)) {
+            last = furi_get_tick();
+            emit(s, HoneMsgWifi, &b, sizeof(b));
+            FURI_LOG_I(TAG, "wifi aps %u best %d probes %u", b.aps, b.best_rssi, b.probes);
+        } else {
+            last = furi_get_tick();
+            furi_delay_ms(external ? HONE_WIFI_RETRY_MS : HONE_WIFI_EVERY_MS); /* no board */
+        }
+    }
+    return 0;
+}
+
+static void lane_start(const char* name, FuriThreadCallback cb, HoneSrv* s) {
+    FuriThread* t = furi_thread_alloc_ex(name, HONE_LANE_STACK, cb, s);
+    furi_thread_start(t); /* lanes run for the life of the firmware */
 }
 
 /* ─── service entry ─────────────────────────────────────────────────────── */
@@ -546,17 +628,28 @@ int32_t hone_srv(void* p) {
     counter_load(s);
     read_file(s->storage, HONE_ANCHOR_PATH, s->anchor, HONE_ANCHOR_LEN);
     hone_sched_init(&s->sched);
+    hone_sched_set_enabled(&s->sched, HoneSensorSubGhz, false); /* own lane */
+    hone_sched_set_enabled(&s->sched, HoneSensorWifi, false);   /* own lane */
+    s->emit_lock = furi_mutex_alloc(FuriMutexTypeNormal);
 
     /* The Wi-Fi dev board sits on USART; stop the expansion-module listener
      * from claiming that port. */
     Expansion* expansion = furi_record_open(RECORD_EXPANSION);
     expansion_disable(expansion);
     furi_record_close(RECORD_EXPANSION);
+    s->paused = storage_file_exists(s->storage, HONE_MAINT_PATH);
     FURI_LOG_I(TAG, "started, counter %lu", s->counter);
+    lane_start("HoneSubGhz", subghz_lane, s);
+    lane_start("HoneWifi", wifi_lane, s);
 
+    uint32_t last_maint_check = furi_get_tick();
     while(1) {
-        if(storage_file_exists(s->storage, HONE_MAINT_PATH)) {
-            furi_delay_ms(5000);
+        if(furi_get_tick() - last_maint_check > furi_ms_to_ticks(5000)) {
+            s->paused = storage_file_exists(s->storage, HONE_MAINT_PATH);
+            last_maint_check = furi_get_tick();
+        }
+        if(s->paused) {
+            furi_delay_ms(1000);
             continue;
         }
         hone_sched_set_battery(&s->sched, furi_hal_power_get_pct());
