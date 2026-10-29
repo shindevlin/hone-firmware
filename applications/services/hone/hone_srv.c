@@ -45,6 +45,9 @@
 #include <furi_hal_serial.h>
 #include <furi_hal_serial_control.h>
 #include <expansion/expansion.h>
+#include <furi_hal_bt.h>
+#include <furi_hal_version.h>
+#include <bt/bt_service/bt.h>
 #include <stdlib.h>
 
 #define TAG "HoneSrv"
@@ -80,6 +83,8 @@ typedef struct {
     uint8_t frame[HONE_FRAME_MAX];
     FuriMutex* emit_lock;   /* counter, frame buffer, queue file */
     volatile bool paused;   /* maintenance mode, refreshed by the tag lane */
+    volatile bool ext_power;        /* last VBUS reading, taken with 5 V out off */
+    volatile uint32_t wifi_ok_tick; /* last time the dev board answered */
 } HoneSrv;
 
 /* ─── storage helpers ───────────────────────────────────────────────────── */
@@ -588,6 +593,7 @@ static int32_t wifi_lane(void* ctx) {
         /* Read VBUS while our 5 V output is off, so it reflects real external power. */
         bool external = !furi_hal_power_is_otg_enabled() &&
                         furi_hal_power_get_usb_voltage() > HONE_EXT_POWER_V;
+        s->ext_power = external;
         if(!external && last && furi_get_tick() - last < furi_ms_to_ticks(HONE_WIFI_EVERY_MS)) {
             furi_delay_ms(1000); /* on battery: at most one scan a minute */
             continue;
@@ -595,11 +601,100 @@ static int32_t wifi_lane(void* ctx) {
         HoneBodyWifi b;
         if(capture_wifi(&b)) {
             last = furi_get_tick();
+            s->wifi_ok_tick = last;
             emit(s, HoneMsgWifi, &b, sizeof(b));
             FURI_LOG_I(TAG, "wifi aps %u best %d probes %u", b.aps, b.best_rssi, b.probes);
         } else {
             last = furi_get_tick();
             furi_delay_ms(external ? HONE_WIFI_RETRY_MS : HONE_WIFI_EVERY_MS); /* no board */
+        }
+    }
+    return 0;
+}
+
+/* ─── announce lane: signed BLE broadcast any HONE device can verify ───── */
+
+#define HONE_ANNOUNCE_EVERY_MS 30000 /* re-sign with fresh counter/state */
+#define HONE_FRAG_MS           200   /* one fragment per beacon update */
+#define HONE_FRAG_DATA         23    /* 31-byte advert minus 8 header bytes */
+#define HONE_BEACON_COMPANY    0xFFFF /* BT SIG "testing" ID until HONE has its own */
+
+/* Advert (31 B): [len][0xFF][company lo][company hi]['H']['A'][seq][idx<<4 | total][data <= 23]
+ * Receivers collect idx 0..total-1 with the same seq, concatenate, verify the
+ * ed25519 signature with the pubkey inside the body, then look the key up on chain. */
+static size_t build_announce(HoneSrv* s, uint8_t* out) {
+    HoneBodyAnnounce b = {
+        .caps = HONE_CAP_SUBGHZ | HONE_CAP_NFC | HONE_CAP_RFID | HONE_CAP_IBUTTON | HONE_CAP_IR,
+        .battery_pct = furi_hal_power_get_pct(),
+    };
+    memcpy(b.pubkey, s->pk, 32);
+    if(s->wifi_ok_tick && furi_get_tick() - s->wifi_ok_tick < furi_ms_to_ticks(5 * 60000))
+        b.caps |= HONE_CAP_WIFI;
+    if(s->ext_power) b.flags |= HONE_FLAG_EXT_POWER;
+    if(s->paused) b.flags |= HONE_FLAG_PAUSED;
+
+    furi_check(furi_mutex_acquire(s->emit_lock, FuriWaitForever) == FuriStatusOk);
+    b.last_counter = s->counter ? s->counter - 1 : 0;
+    size_t len = hone_frame_build(
+        out, HoneMsgAnnounce, &b, sizeof(b), s->pk, s->sk, counter_next(s), s->anchor);
+    furi_mutex_release(s->emit_lock);
+    return len;
+}
+
+static int32_t announce_lane(void* ctx) {
+    HoneSrv* s = ctx;
+    furi_record_open(RECORD_BT); /* blocks until the BT service is up */
+    furi_record_close(RECORD_BT);
+
+    GapExtraBeaconConfig cfg = {
+        .min_adv_interval_ms = 100,
+        .max_adv_interval_ms = 150,
+        .adv_channel_map = GapAdvChannelMapAll,
+        .adv_power_level = GapAdvPowerLevel_0dBm,
+        .address_type = GapAddressTypePublic,
+    };
+    memcpy(cfg.address, furi_hal_version_get_ble_mac(), sizeof(cfg.address));
+    cfg.address[0] ^= 0xFF; /* distinct from the main advertising address */
+    cfg.address[3] ^= 0xFF;
+    if(!furi_hal_bt_extra_beacon_set_config(&cfg)) {
+        FURI_LOG_E(TAG, "announce: beacon config refused");
+        return 0;
+    }
+
+    uint8_t frame[HONE_FRAME_MAX];
+    uint8_t adv[31];
+    size_t len = 0;
+    uint32_t built = 0;
+    uint8_t seq = 0;
+    bool started = false;
+    while(1) {
+        if(s->paused) {
+            if(started) furi_hal_bt_extra_beacon_stop();
+            started = false;
+            furi_delay_ms(1000);
+            continue;
+        }
+        if(!len || furi_get_tick() - built > furi_ms_to_ticks(HONE_ANNOUNCE_EVERY_MS)) {
+            len = build_announce(s, frame);
+            built = furi_get_tick();
+            seq++;
+        }
+        uint8_t total = (uint8_t)((len + HONE_FRAG_DATA - 1) / HONE_FRAG_DATA);
+        for(uint8_t i = 0; i < total; i++) {
+            size_t off = (size_t)i * HONE_FRAG_DATA;
+            size_t n = MIN((size_t)HONE_FRAG_DATA, len - off);
+            adv[0] = (uint8_t)(7 + n);
+            adv[1] = 0xFF;
+            adv[2] = HONE_BEACON_COMPANY & 0xFF;
+            adv[3] = HONE_BEACON_COMPANY >> 8;
+            adv[4] = 'H';
+            adv[5] = 'A';
+            adv[6] = seq;
+            adv[7] = (uint8_t)((i << 4) | total);
+            memcpy(adv + 8, frame + off, n);
+            furi_hal_bt_extra_beacon_set_data(adv, (uint8_t)(8 + n));
+            if(!started) started = furi_hal_bt_extra_beacon_start();
+            furi_delay_ms(HONE_FRAG_MS);
         }
     }
     return 0;
@@ -641,6 +736,7 @@ int32_t hone_srv(void* p) {
     FURI_LOG_I(TAG, "started, counter %lu", s->counter);
     lane_start("HoneSubGhz", subghz_lane, s);
     lane_start("HoneWifi", wifi_lane, s);
+    lane_start("HoneAnnounce", announce_lane, s);
 
     uint32_t last_maint_check = furi_get_tick();
     while(1) {

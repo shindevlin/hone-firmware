@@ -28,7 +28,7 @@
 #define HONE_DEVICE_ID_LEN 8
 #define HONE_ANCHOR_LEN  8
 #define HONE_SIG_LEN     64
-#define HONE_MAX_BODY    32
+#define HONE_MAX_BODY    48
 
 typedef enum {
     HoneMsgSubGhz    = 0x01,
@@ -38,6 +38,7 @@ typedef enum {
     HoneMsgHeartbeat = 0x05,
     HoneMsgIr        = 0x06,
     HoneMsgWifi      = 0x07,
+    HoneMsgAnnounce  = 0x08, /* broadcast only, never queued */
 } HoneMsgType;
 
 typedef struct __attribute__((packed)) {
@@ -101,6 +102,25 @@ typedef struct __attribute__((packed)) {
     uint16_t probes;      /* probe requests heard (ch 1/6/11, 0.5 s each) */
     uint8_t  uniq;        /* distinct probe senders (upper bound: MAC randomisation) */
 } HoneBodyWifi;
+
+/* Signed announce, broadcast over BLE so any HONE device in range can verify
+ * who this is without pairing. Carries the full public key; the chain's
+ * device registration says who owns it. */
+#define HONE_CAP_SUBGHZ  (1u << 0)
+#define HONE_CAP_NFC     (1u << 1)
+#define HONE_CAP_RFID    (1u << 2)
+#define HONE_CAP_IBUTTON (1u << 3)
+#define HONE_CAP_IR      (1u << 4)
+#define HONE_CAP_WIFI    (1u << 5) /* dev board answered recently */
+#define HONE_FLAG_EXT_POWER (1u << 0)
+#define HONE_FLAG_PAUSED    (1u << 1)
+typedef struct __attribute__((packed)) {
+    uint8_t  pubkey[32];
+    uint16_t caps;
+    uint32_t last_counter; /* newest reading counter in the queue */
+    uint8_t  battery_pct;
+    uint8_t  flags;
+} HoneBodyAnnounce; /* 40 bytes */
 
 /* Build + sign a frame into out (>= HONE_FRAME_MAX). Returns total length. */
 size_t hone_frame_build(

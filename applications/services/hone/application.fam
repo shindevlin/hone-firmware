@@ -4,7 +4,7 @@ App(
     apptype=FlipperAppType.SERVICE,
     entry_point="hone_srv",
     cdefines=["SRV_HONE"],
-    requires=["storage"],
+    requires=["storage", "bt"],
     # own thread, own stack: ed25519 sign (TweetNaCl) needs ~3 KB
     stack_size=8 * 1024,
     order=200,

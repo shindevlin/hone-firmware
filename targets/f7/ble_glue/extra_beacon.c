@@ -125,11 +125,11 @@ bool gap_extra_beacon_set_data(const uint8_t* data, uint8_t length) {
     extra_beacon.extra_beacon_data_len = length;
 
     tBleStatus status = aci_gap_additional_beacon_set_data(length, data);
+    furi_mutex_release(extra_beacon.state_mutex);
     if(status) {
         FURI_LOG_E(TAG, "Failed updating adv data: %d", status);
         return false;
     }
-    furi_mutex_release(extra_beacon.state_mutex);
 
     return true;
 }
