@@ -62,6 +62,36 @@
 #define HONE_QUEUE_OLD   HONE_DIR "/queue.old"
 #define HONE_MAINT_PATH  HONE_DIR "/maintenance"
 #define HONE_OWNER_PATH  HONE_DIR "/owner.txt" /* chain account name, set at claim */
+#define HONE_COMMIT_PATH HONE_DIR "/commits.bin" /* every signed batch commit, appended */
+
+/* ─── batch commits ───────────────────────────────────────────────────────
+ * Readings are grouped per enrolled sensor id (flipper-<devid>-<group>). Every
+ * minute (or 60 readings) a group's frames are summed into batch_hash =
+ * sha256(frame || frame || ...), and the Flipper signs the chain's
+ * SENSOR_DATA_COMMIT canonical message with its own key. The signed commit is
+ * broadcast over BLE ('HC'), so any HONE phone in range can submit it to the
+ * chain from anywhere; the frames themselves stay in queue.bin as the evidence
+ * batch_hash commits to. */
+#define HONE_GROUPS        4
+#define HONE_BATCH_MS      60000u
+#define HONE_BATCH_MAX     60u
+#define HONE_COMMIT_LEN    (8 + 1 + 2 + 32 + 64) /* devid, group, count, hash, sig */
+#define HONE_COMMIT_SLOTS  8
+#define HONE_COMMIT_TTL_MS (15u * 60u * 1000u)   /* re-broadcast each commit for 15 min */
+static const char* const hone_group_name[HONE_GROUPS] = {"subghz", "wifi", "tags", "ir"};
+static const char* const hone_group_type[HONE_GROUPS] = {"continuous", "continuous", "event", "event"};
+
+typedef struct {
+    mbedtls_sha256_context h;
+    uint16_t count;
+    uint32_t started;
+} HoneBatch;
+
+typedef struct {
+    uint8_t data[HONE_COMMIT_LEN];
+    uint32_t made; /* tick; 0 = empty slot */
+    uint8_t seq;
+} HoneCommit;
 
 #define HONE_CTR_RESERVE  1000u          /* counter block persisted ahead */
 #define HONE_QUEUE_MAX    (1024u * 1024u) /* rotate queue at 1 MB */
@@ -87,6 +117,10 @@ typedef struct {
     volatile bool ext_power;        /* last VBUS reading, taken with 5 V out off */
     volatile uint32_t wifi_ok_tick; /* last time the dev board answered */
     char owner[16];                 /* from owner.txt, NUL-padded */
+    HoneBatch batch[HONE_GROUPS];   /* guarded by emit_lock */
+    HoneCommit commits[HONE_COMMIT_SLOTS];
+    uint8_t commit_next;
+    uint8_t commit_seq;
 } HoneSrv;
 
 /* ─── storage helpers ───────────────────────────────────────────────────── */
@@ -511,6 +545,18 @@ static bool capture_wifi(HoneBodyWifi* out) {
     return got;
 }
 
+static int group_of(HoneMsgType t) {
+    switch(t) {
+    case HoneMsgSubGhz: return 0;
+    case HoneMsgWifi: return 1;
+    case HoneMsgRfid:
+    case HoneMsgNfc:
+    case HoneMsgIButton: return 2;
+    case HoneMsgIr: return 3;
+    default: return -1;
+    }
+}
+
 static void emit(HoneSrv* s, HoneMsgType type, const void* body, uint8_t body_len) {
     furi_check(furi_mutex_acquire(s->emit_lock, FuriWaitForever) == FuriStatusOk);
     size_t len = hone_frame_build(
@@ -518,8 +564,83 @@ static void emit(HoneSrv* s, HoneMsgType type, const void* body, uint8_t body_le
     if(len) {
         queue_append(s, s->frame, len);
         s->total_frames++;
+        int g = group_of(type);
+        if(g >= 0) {
+            HoneBatch* b = &s->batch[g];
+            if(b->count == 0) {
+                mbedtls_sha256_init(&b->h);
+                mbedtls_sha256_starts(&b->h, 0);
+                b->started = furi_get_tick();
+            }
+            mbedtls_sha256_update(&b->h, s->frame, len);
+            b->count++;
+        }
     }
     furi_mutex_release(s->emit_lock);
+}
+
+static void hex_into(char* out, const uint8_t* in, size_t n) {
+    static const char hx[] = "0123456789abcdef";
+    for(size_t i = 0; i < n; i++) {
+        out[2 * i] = hx[in[i] >> 4];
+        out[2 * i + 1] = hx[in[i] & 15];
+    }
+    out[2 * n] = 0;
+}
+
+/* Close any batch that is due: sign the chain's SENSOR_DATA_COMMIT canonical
+ * message (compact JSON, fixed key order — must match hone-node tx.rs) and keep
+ * the signed commit for broadcast. Called from the announce lane. */
+static void batches_flush(HoneSrv* s) {
+    if(!s->owner[0]) return; /* not claimed: nobody to commit for */
+    for(int g = 0; g < HONE_GROUPS; g++) {
+        uint8_t hash[32];
+        uint16_t count;
+        furi_check(furi_mutex_acquire(s->emit_lock, FuriWaitForever) == FuriStatusOk);
+        HoneBatch* b = &s->batch[g];
+        bool due = b->count > 0 &&
+                   (b->count >= HONE_BATCH_MAX ||
+                    furi_get_tick() - b->started >= furi_ms_to_ticks(HONE_BATCH_MS));
+        if(due) {
+            mbedtls_sha256_finish(&b->h, hash);
+            mbedtls_sha256_free(&b->h);
+            count = b->count;
+            b->count = 0;
+        }
+        furi_mutex_release(s->emit_lock);
+        if(!due) continue;
+
+        char dev[17], hash_hex[65], owner[17] = {0};
+        hex_into(dev, s->pk, 8);
+        hex_into(hash_hex, hash, 32);
+        memcpy(owner, s->owner, 16);
+        char msg[384];
+        int n = snprintf(
+            msg, sizeof(msg),
+            "{\"chain_id\":\"hone\",\"type\":\"SENSOR_DATA_COMMIT\","
+            "\"sensor_id\":\"flipper-%s-%s\",\"owner\":\"%s\",\"batch_hash\":\"%s\","
+            "\"reading_count\":%u,\"sensor_type\":\"%s\",\"signed_by\":\"%s\"}",
+            dev, hone_group_name[g], owner, hash_hex, (unsigned)count, hone_group_type[g], owner);
+        if(n <= 0 || n >= (int)sizeof(msg)) continue;
+
+        HoneCommit* c = &s->commits[s->commit_next];
+        s->commit_next = (s->commit_next + 1) % HONE_COMMIT_SLOTS;
+        memcpy(c->data, s->pk, 8);
+        c->data[8] = (uint8_t)g;
+        c->data[9] = (uint8_t)(count & 0xFF);
+        c->data[10] = (uint8_t)(count >> 8);
+        memcpy(c->data + 11, hash, 32);
+        hone_ed25519_sign(c->data + 43, (const uint8_t*)msg, (size_t)n, s->sk);
+        c->seq = ++s->commit_seq;
+        c->made = furi_get_tick() ? furi_get_tick() : 1;
+
+        File* f = storage_file_alloc(s->storage);
+        if(storage_file_open(f, HONE_COMMIT_PATH, FSAM_WRITE, FSOM_OPEN_APPEND))
+            storage_file_write(f, c->data, HONE_COMMIT_LEN);
+        storage_file_close(f);
+        storage_file_free(f);
+        FURI_LOG_I(TAG, "commit %s x%u", hone_group_name[g], (unsigned)count);
+    }
 }
 
 /* Run one slot. Returns true if the sensor produced a reading. */
@@ -663,6 +784,29 @@ static size_t build_announce(HoneSrv* s, uint8_t* out) {
     return len;
 }
 
+/* Advert (31 B): [len][0xFF][company lo][company hi]['H'][kind][seq][idx<<4 | total][data <= 23]
+ * kind 'A' = signed announce frame, 'C' = signed batch commit. */
+static void send_fragments(
+    uint8_t* adv, char kind, uint8_t seq, const uint8_t* data, size_t len, bool* started) {
+    uint8_t total = (uint8_t)((len + HONE_FRAG_DATA - 1) / HONE_FRAG_DATA);
+    for(uint8_t i = 0; i < total; i++) {
+        size_t off = (size_t)i * HONE_FRAG_DATA;
+        size_t n = MIN((size_t)HONE_FRAG_DATA, len - off);
+        adv[0] = (uint8_t)(7 + n);
+        adv[1] = 0xFF;
+        adv[2] = HONE_BEACON_COMPANY & 0xFF;
+        adv[3] = HONE_BEACON_COMPANY >> 8;
+        adv[4] = 'H';
+        adv[5] = (uint8_t)kind;
+        adv[6] = seq;
+        adv[7] = (uint8_t)((i << 4) | total);
+        memcpy(adv + 8, data + off, n);
+        furi_hal_bt_extra_beacon_set_data(adv, (uint8_t)(8 + n));
+        if(!*started) *started = furi_hal_bt_extra_beacon_start();
+        furi_delay_ms(HONE_FRAG_MS);
+    }
+}
+
 static int32_t announce_lane(void* ctx) {
     HoneSrv* s = ctx;
     furi_record_open(RECORD_BT); /* blocks until the BT service is up */
@@ -701,22 +845,16 @@ static int32_t announce_lane(void* ctx) {
             built = furi_get_tick();
             seq++;
         }
-        uint8_t total = (uint8_t)((len + HONE_FRAG_DATA - 1) / HONE_FRAG_DATA);
-        for(uint8_t i = 0; i < total; i++) {
-            size_t off = (size_t)i * HONE_FRAG_DATA;
-            size_t n = MIN((size_t)HONE_FRAG_DATA, len - off);
-            adv[0] = (uint8_t)(7 + n);
-            adv[1] = 0xFF;
-            adv[2] = HONE_BEACON_COMPANY & 0xFF;
-            adv[3] = HONE_BEACON_COMPANY >> 8;
-            adv[4] = 'H';
-            adv[5] = 'A';
-            adv[6] = seq;
-            adv[7] = (uint8_t)((i << 4) | total);
-            memcpy(adv + 8, frame + off, n);
-            furi_hal_bt_extra_beacon_set_data(adv, (uint8_t)(8 + n));
-            if(!started) started = furi_hal_bt_extra_beacon_start();
-            furi_delay_ms(HONE_FRAG_MS);
+        send_fragments(adv, 'A', seq, frame, len, &started);
+        batches_flush(s);
+        for(int i = 0; i < HONE_COMMIT_SLOTS; i++) {
+            HoneCommit* c = &s->commits[i];
+            if(!c->made) continue;
+            if(furi_get_tick() - c->made > furi_ms_to_ticks(HONE_COMMIT_TTL_MS)) {
+                c->made = 0;
+                continue;
+            }
+            send_fragments(adv, 'C', c->seq, c->data, HONE_COMMIT_LEN, &started);
         }
     }
     return 0;
