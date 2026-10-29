@@ -37,6 +37,7 @@ typedef enum {
     HoneMsgIButton   = 0x04,
     HoneMsgHeartbeat = 0x05,
     HoneMsgIr        = 0x06,
+    HoneMsgWifi      = 0x07,
 } HoneMsgType;
 
 typedef struct __attribute__((packed)) {
@@ -91,6 +92,15 @@ typedef struct __attribute__((packed)) {
     uint32_t command;
     uint16_t raw_timings; /* timing count when undecoded */
 } HoneBodyIr;
+
+/* Wi-Fi dev board scan. Counts only: no SSID, BSSID or MAC is ever sent. */
+typedef struct __attribute__((packed)) {
+    uint8_t  aps;         /* access points seen (2.4 GHz) */
+    int8_t   best_rssi;   /* strongest AP, dBm (0 if none) */
+    uint8_t  ch[13];      /* APs per channel 1..13 */
+    uint16_t probes;      /* probe requests heard (ch 1/6/11, 0.5 s each) */
+    uint8_t  uniq;        /* distinct probe senders (upper bound: MAC randomisation) */
+} HoneBodyWifi;
 
 /* Build + sign a frame into out (>= HONE_FRAME_MAX). Returns total length. */
 size_t hone_frame_build(

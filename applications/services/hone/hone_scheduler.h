@@ -36,6 +36,7 @@ typedef enum {
     HoneSensorRfid,       /* event: 125kHz card in field               */
     HoneSensorIButton,    /* event: 1-Wire iButton contact             */
     HoneSensorIr,         /* event: infrared remote signal             */
+    HoneSensorWifi,       /* continuous: Wi-Fi dev board scan          */
     HoneSensorHeartbeat,  /* housekeeping: battery/uptime              */
     HoneSensorCount,
 } HoneSensorKind;

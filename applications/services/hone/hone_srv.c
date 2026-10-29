@@ -34,6 +34,10 @@
 #include <ibutton/ibutton_protocols.h>
 #include <infrared_worker.h>
 #include <mbedtls/sha256.h>
+#include <furi_hal_serial.h>
+#include <furi_hal_serial_control.h>
+#include <expansion/expansion.h>
+#include <stdlib.h>
 
 #define TAG "HoneSrv"
 #define HONE_FW_VERSION "2.0.0"
@@ -349,6 +353,102 @@ static bool capture_ir(HoneBodyIr* out) {
     return got;
 }
 
+/* ─── Wi-Fi dev board (hone-esp on ESP32-S2, USART pins 13/14) ─────────── */
+
+#define HONE_WIFI_BAUD    230400
+#define HONE_WIFI_BOOT_MS 4000
+#define HONE_WIFI_SCAN_MS 10000
+
+static void wifi_rx_cb(FuriHalSerialHandle* h, FuriHalSerialRxEvent ev, void* ctx) {
+    if(ev & FuriHalSerialRxEventData) {
+        uint8_t b = furi_hal_serial_async_rx(h);
+        furi_stream_buffer_send(ctx, &b, 1, 0);
+    }
+}
+
+static bool wifi_readline(FuriStreamBuffer* sb, char* buf, size_t cap, uint32_t timeout_ms) {
+    size_t n = 0;
+    uint32_t start = furi_get_tick();
+    while(furi_get_tick() - start < furi_ms_to_ticks(timeout_ms)) {
+        uint8_t c;
+        if(furi_stream_buffer_receive(sb, &c, 1, furi_ms_to_ticks(50)) != 1) continue;
+        if(c == '\r') continue;
+        if(c == '\n') {
+            if(n) {
+                buf[n] = 0;
+                return true;
+            }
+            continue;
+        }
+        if(n < cap - 1) buf[n++] = (char)c;
+    }
+    return false;
+}
+
+static int kv_int(const char* line, const char* key) {
+    const char* p = strstr(line, key);
+    return p ? atoi(p + strlen(key)) : 0;
+}
+
+static bool wifi_parse(const char* line, HoneBodyWifi* out) {
+    if(strncmp(line, "WIFI ", 5) != 0) return false;
+    memset(out, 0, sizeof(*out));
+    out->aps = (uint8_t)MIN(kv_int(line, "aps="), 255);
+    out->best_rssi = (int8_t)kv_int(line, "best=");
+    out->probes = (uint16_t)MIN(kv_int(line, "probes="), 0xFFFF);
+    out->uniq = (uint8_t)MIN(kv_int(line, "uniq="), 255);
+    const char* p = strstr(line, "ch=");
+    if(p) {
+        p += 3;
+        for(int i = 0; i < 13 && *p && *p != ' '; i++) {
+            out->ch[i] = (uint8_t)MIN(atoi(p), 255);
+            while(*p && *p != ',' && *p != ' ') p++;
+            if(*p == ',') p++;
+        }
+    }
+    return true;
+}
+
+static bool capture_wifi(HoneBodyWifi* out) {
+    bool otg_was_on = furi_hal_power_is_otg_enabled();
+    if(!otg_was_on) furi_hal_power_enable_otg();
+    FuriHalSerialHandle* h = furi_hal_serial_control_acquire(FuriHalSerialIdUsart);
+    if(!h) {
+        if(!otg_was_on) furi_hal_power_disable_otg();
+        return false;
+    }
+    FuriStreamBuffer* sb = furi_stream_buffer_alloc(512, 1);
+    furi_hal_serial_init(h, HONE_WIFI_BAUD);
+    furi_hal_serial_async_rx_start(h, wifi_rx_cb, sb, false);
+
+    char line[96];
+    bool alive = false, got = false;
+    uint32_t start = furi_get_tick();
+    while(!alive && furi_get_tick() - start < furi_ms_to_ticks(HONE_WIFI_BOOT_MS)) {
+        furi_hal_serial_tx(h, (const uint8_t*)"PING\n", 5);
+        while(wifi_readline(sb, line, sizeof(line), 500)) {
+            if(strncmp(line, "PONG", 4) == 0) {
+                alive = true;
+                break;
+            }
+        }
+    }
+    if(alive) {
+        furi_hal_serial_tx(h, (const uint8_t*)"SCAN\n", 5);
+        start = furi_get_tick();
+        while(!got && furi_get_tick() - start < furi_ms_to_ticks(HONE_WIFI_SCAN_MS)) {
+            if(wifi_readline(sb, line, sizeof(line), 500)) got = wifi_parse(line, out);
+        }
+    }
+
+    furi_hal_serial_async_rx_stop(h);
+    furi_hal_serial_deinit(h);
+    furi_hal_serial_control_release(h);
+    furi_stream_buffer_free(sb);
+    if(!otg_was_on) furi_hal_power_disable_otg(); /* board fully off between slots */
+    return got;
+}
+
 static void emit(HoneSrv* s, HoneMsgType type, const void* body, uint8_t body_len) {
     size_t len = hone_frame_build(
         s->frame, type, body, body_len, s->pk, s->sk, counter_next(s), s->anchor);
@@ -406,6 +506,13 @@ static bool run_slot(HoneSrv* s, HoneSensorKind k) {
         FURI_LOG_I(TAG, "ir proto %d addr %lx cmd %lx", b.protocol, b.address, b.command);
         return true;
     }
+    case HoneSensorWifi: {
+        HoneBodyWifi b;
+        if(!capture_wifi(&b)) return false;
+        emit(s, HoneMsgWifi, &b, sizeof(b));
+        FURI_LOG_I(TAG, "wifi aps %u best %d probes %u", b.aps, b.best_rssi, b.probes);
+        return true;
+    }
     default:
         return false;
     }
@@ -429,6 +536,12 @@ int32_t hone_srv(void* p) {
     counter_load(s);
     read_file(s->storage, HONE_ANCHOR_PATH, s->anchor, HONE_ANCHOR_LEN);
     hone_sched_init(&s->sched);
+
+    /* The Wi-Fi dev board sits on USART; stop the expansion-module listener
+     * from claiming that port. */
+    Expansion* expansion = furi_record_open(RECORD_EXPANSION);
+    expansion_disable(expansion);
+    furi_record_close(RECORD_EXPANSION);
     FURI_LOG_I(TAG, "started, counter %lu", s->counter);
 
     while(1) {
