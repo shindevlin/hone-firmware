@@ -832,6 +832,7 @@ static int32_t announce_lane(void* ctx) {
     size_t len = 0;
     uint32_t built = 0;
     uint8_t seq = 0;
+    uint8_t rr = 0;
     bool started = false;
     while(1) {
         if(s->paused) {
@@ -847,14 +848,18 @@ static int32_t announce_lane(void* ctx) {
         }
         send_fragments(adv, 'A', seq, frame, len, &started);
         batches_flush(s);
-        for(int i = 0; i < HONE_COMMIT_SLOTS; i++) {
-            HoneCommit* c = &s->commits[i];
+        /* One commit per cycle, round-robin, so the announce (which receivers need
+         * first) keeps most of the airtime. */
+        for(int tries = 0; tries < HONE_COMMIT_SLOTS; tries++) {
+            HoneCommit* c = &s->commits[rr];
+            rr = (rr + 1) % HONE_COMMIT_SLOTS;
             if(!c->made) continue;
             if(furi_get_tick() - c->made > furi_ms_to_ticks(HONE_COMMIT_TTL_MS)) {
                 c->made = 0;
                 continue;
             }
             send_fragments(adv, 'C', c->seq, c->data, HONE_COMMIT_LEN, &started);
+            break;
         }
     }
     return 0;
