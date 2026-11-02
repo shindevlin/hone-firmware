@@ -140,9 +140,9 @@ typedef struct __attribute__((packed)) {
 
 /* HONE sightings (0x0A). Emitted when a window closes, 5 entries per frame. */
 typedef enum {
-    HoneSightRid     = 1, /* rotating rid advert ('hR' v1): id = rid[16] */
+    HoneSightRid     = 1, /* older rid advert ('hR' v1): id = rid[16] */
     HoneSightFlipper = 2, /* HONE Flipper announce ('HA'): id = device_id[8], rest 0 */
-    HoneSightLookup  = 3, /* per-window key advert: id = lookup id sha256(pk_w)[0..16] */
+    HoneSightLookup  = 3, /* window key advert ('hK' v2): id = lookup id sha256(pk_w)[0..16] */
 } HoneSightKind;
 typedef struct __attribute__((packed)) {
     uint8_t kind;     /* HoneSightKind */
@@ -190,7 +190,7 @@ typedef struct __attribute__((packed)) {
 #define HONE_CAP_IR      (1u << 4)
 #define HONE_CAP_WIFI    (1u << 5) /* dev board answered recently */
 #define HONE_CAP_BLE_OBS (1u << 6) /* BLE observer running (full radio stack) */
-#define HONE_CAP_RID     (1u << 7) /* id_seed provisioned: rotating rid advert on */
+#define HONE_CAP_RID     (1u << 7) /* id_seed provisioned: rotating id advert ('hK') on */
 #define HONE_FLAG_EXT_POWER (1u << 0)
 #define HONE_FLAG_PAUSED    (1u << 1)
 typedef struct __attribute__((packed)) {

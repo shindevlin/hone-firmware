@@ -8,7 +8,14 @@ line per command and reply. The board's own USB port accepts the same commands f
 | Command | Reply |
 |---|---|
 | `PING` | `PONG hone-esp <ver>` |
-| `SCAN` | `WIFI aps=N best=R ch=c1,...,c13 probes=P uniq=U ms=T` |
+| `SCAN` | `WIFI aps=N best=R ch=c1,...,c13 probes=P uniq=U ms=T` (v1) |
+| `KEY <64 hex>` | `OK key` — oid key for SCAN2, RAM only (the Flipper sends HMAC(K_day, "hone-wifi")) |
+| `SCAN2 [listen_ms]` | `WIFI2 aps=N la=L best=R ch=c1,...,c13 probes=P uniq=U listen=S top=<oid>:<rssi>:<ch>,... ms=T` |
+| `DLBOOT` | `OK dlboot`, then reboot into the ROM download mode on UART0 (reflash through the Flipper's USB-UART bridge) |
+
+SCAN2 (0.2.0, HONE spec 2b): one active scan, then `listen_ms` (default 15000, max 30000) of continuous
+probe listening hopping channels 1/6/11. The 8 strongest APs and the probe senders are reported as
+`oid = HMAC-SHA256(key, mac)[0..8]`; `la` counts APs with a locally administered BSSID (phone hotspots).
 
 No SSID, BSSID or client MAC leaves the chip. APs are counted per channel; probe requests are counted,
 and distinct senders via a per-boot salted hash in RAM (MAC randomisation makes `uniq` an upper bound).

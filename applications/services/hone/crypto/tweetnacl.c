@@ -409,4 +409,52 @@ int crypto_sign_open(u8 *m, u64 *mlen, const u8 *sm, u64 smlen, const u8 *pk) {
     return 0;
 }
 
+
+/* ─── X25519 (crypto_scalarmult), from the TweetNaCl reference ─────────── */
+
+static const gf _121665 = {0xDB41, 1};
+
+static void unpack25519(gf o, const u8 *n) {
+    for(int i=0;i<16;i++) o[i]=n[2*i]+((i64)n[2*i+1]<<8);
+    o[15]&=0x7fff;
+}
+
+int crypto_scalarmult(u8 *q, const u8 *n, const u8 *p) {
+    u8 z[32];
+    i64 x[80], r;
+    gf a, b, c, d, e, f;
+    for(int i=0;i<31;i++) z[i]=n[i];
+    z[31]=(n[31]&127)|64;
+    z[0]&=248;
+    unpack25519(x,p);
+    for(int i=0;i<16;i++) { b[i]=x[i]; d[i]=a[i]=c[i]=0; }
+    a[0]=d[0]=1;
+    for(int i=254;i>=0;--i) {
+        r=(z[i>>3]>>(i&7))&1;
+        sel25519(a,b,(int)r);
+        sel25519(c,d,(int)r);
+        A(e,a,c); Z(a,a,c); A(c,b,d); Z(b,b,d);
+        S(d,e); S(f,a); M(a,c,a); M(c,b,e);
+        A(e,a,c); Z(a,a,c); S(b,a); Z(c,d,f);
+        M(a,c,_121665); A(a,a,d); M(c,c,a); M(a,d,f);
+        M(d,b,x); S(b,e);
+        sel25519(a,b,(int)r);
+        sel25519(c,d,(int)r);
+    }
+    for(int i=0;i<16;i++) { x[i+16]=a[i]; x[i+32]=c[i]; x[i+48]=b[i]; x[i+64]=d[i]; }
+    inv25519(x+32,x+32);
+    M(x+16,x+16,x+32);
+    pack25519(q,x+16);
+    memset(z, 0, sizeof(z));
+    return 0;
+}
+
+int crypto_scalarmult_base(u8 *q, const u8 *n) {
+    return crypto_scalarmult(q,n,_9);
+}
+
+int crypto_hash_sha512(u8 *out, const u8 *m, u64 n) {
+    return crypto_hash(out, m, n);
+}
+
 #pragma GCC diagnostic pop

@@ -9,7 +9,7 @@
  *   - BLE lane: passive scan window every minute (needs the full radio stack):
  *     crowd count as day-keyed oids, and sightings of other HONE devices
  *   - announce lane: signed HA announce + HC batch commits, and the rotating
- *     rid advert ('hR') on its own address, both rotating at UTC quarter-hours
+ *     window-key advert ('hK') on its own addresses, rotating at UTC quarter-hours
  *   - tag lane (service thread): rotates NFC (+IR), iButton (+IR), RFID, IR,
  *     heartbeat. NFC and iButton both need TIM1 and RFID needs TIM1+TIM2, so
  *     only one of them runs at a time; IR receive (TIM2 only) rides along
@@ -55,6 +55,9 @@
 #include <bt/bt_service/bt.h>
 #include <gap_observer.h>
 #include <furi_hal_random.h>
+#include <furi_hal_crypto.h>
+#include <datetime/datetime.h>
+#include "crypto/tweetnacl.h"
 #include <stdlib.h>
 
 #define TAG "HoneSrv"
@@ -71,10 +74,17 @@
 #define HONE_OWNER_PATH  HONE_DIR "/owner.txt" /* chain account name, set at claim */
 #define HONE_COMMIT_PATH HONE_DIR "/commits.bin" /* every signed batch commit, appended */
 #define HONE_COMMIT_TIME HONE_DIR "/commits.time" /* u32 RTC per commits.bin record, same order */
-/* Rotating-id seed (spec 1a): 32 raw bytes, written by the owner's phone at claim
- * time (derived from the wallet hide key) over USB or BLE RPC storage write.
- * Never logged or sent. No file = no rid advert. Deleting it stops the advert. */
+/* Rotating-id seed (spec 1a). The owner's phone provisions it at claim time
+ * (id_seed = HKDF(hide, "hone-id-seed" || device pubkey)), over USB or BLE RPC
+ * storage write, as either
+ *   id_seed.sealed  92 bytes: FindMy.provisionBlob = ECIES to the X25519 form of
+ *                   this device's ed25519 key (epk 32 | nonce 12 | AES-GCM ct 32 + tag 16,
+ *                   info "hone-seed-provision-v1"), preferred: the SD never holds it in clear
+ *   id_seed         32 raw bytes (bench / USB)
+ * Never logged or sent. Neither file = no id advert. Deleting it stops the advert. */
 #define HONE_SEED_PATH   HONE_DIR "/id_seed"
+#define HONE_SEALED_PATH HONE_DIR "/id_seed.sealed"
+#define HONE_PROVISION_INFO "hone-seed-provision-v1"
 /* The Flipper RTC keeps LOCAL time. Offset of local time from UTC, in minutes,
  * as text (e.g. "-360"). Missing file = HONE_UTC_OFFSET_DEFAULT. */
 #define HONE_TZ_PATH     HONE_DIR "/utc_offset_min"
@@ -147,6 +157,7 @@ typedef struct {
     FuriMutex* seed_lock;
     uint8_t id_seed[32];
     volatile bool seed_ok;
+    volatile uint32_t seed_gen; /* bumps on every seed change */
     /* per-day oid key (spec 1b): RAM only, replaced at UTC midnight */
     FuriMutex* kday_lock;
     uint8_t k_day[32];
@@ -249,12 +260,92 @@ static void hmac_sha256(
     memset(inner, 0, sizeof(inner));
 }
 
+/* RFC 5869 HKDF-SHA256, empty salt = 32 zero bytes (same as Android IdKeys.hkdf). */
+static void hkdf_sha256(
+    const uint8_t* ikm,
+    size_t ikm_len,
+    const uint8_t* salt,
+    size_t salt_len,
+    const uint8_t* info_a,
+    size_t a_len,
+    const uint8_t* info_b,
+    size_t b_len,
+    uint8_t* out,
+    size_t out_len) {
+    static const uint8_t zero[32] = {0};
+    uint8_t prk[32], t[32 + 64 + 1], blk[32];
+    if(!salt_len) {
+        salt = zero;
+        salt_len = 32;
+    }
+    hmac_sha256(salt, salt_len, ikm, ikm_len, NULL, 0, prk);
+    size_t pos = 0, tl = 0;
+    for(uint8_t i = 1; pos < out_len; i++) {
+        /* T(i) = HMAC(prk, T(i-1) || info || i); info here is at most 64 bytes */
+        size_t n = tl;
+        memcpy(t + n, info_a, a_len);
+        n += a_len;
+        if(b_len) memcpy(t + n, info_b, b_len);
+        n += b_len;
+        t[n++] = i;
+        hmac_sha256(prk, 32, t, n, NULL, 0, blk);
+        size_t c = MIN((size_t)32, out_len - pos);
+        memcpy(out + pos, blk, c);
+        pos += c;
+        memcpy(t, blk, 32);
+        tl = 32;
+    }
+    memset(prk, 0, sizeof(prk));
+    memset(t, 0, sizeof(t));
+    memset(blk, 0, sizeof(blk));
+}
+
+/* Open FindMy.provisionBlob: X25519 with this device's key (SHA-512(ed seed)[0..32]),
+ * key = HKDF(shared, salt = epk || pk_x, "hone-seed-provision-v1"), AES-256-GCM. */
+static bool seed_unseal(const HoneSrv* s, const uint8_t blob[92], uint8_t seed[32]) {
+    uint8_t h[64], skx[32], pkx[32], shared[32], salt[64], key[32];
+    crypto_hash_sha512(h, s->sk, 32); /* TweetNaCl sk = seed(32) || pk(32) */
+    memcpy(skx, h, 32);
+    crypto_scalarmult_base(pkx, skx);
+    crypto_scalarmult(shared, skx, blob);
+    memcpy(salt, blob, 32);
+    memcpy(salt + 32, pkx, 32);
+    hkdf_sha256(
+        shared, 32, salt, 64, (const uint8_t*)HONE_PROVISION_INFO,
+        strlen(HONE_PROVISION_INFO), NULL, 0, key, 32);
+    bool ok = furi_hal_crypto_gcm_decrypt_and_verify(
+                  key, blob + 32, NULL, 0, blob + 44, seed, 32, blob + 76) ==
+              FuriHalCryptoGCMStateOk;
+    memset(h, 0, sizeof(h));
+    memset(skx, 0, sizeof(skx));
+    memset(shared, 0, sizeof(shared));
+    memset(key, 0, sizeof(key));
+    if(!ok) memset(seed, 0, 32);
+    return ok;
+}
+
 /* Load or drop the id seed. Called every few seconds; touches RAM only on change. */
 static void seed_load(HoneSrv* s) {
-    uint8_t buf[32];
+    uint8_t buf[32], blob[92];
     bool ok = false;
     FileInfo fi;
-    if(storage_common_stat(s->storage, HONE_SEED_PATH, &fi) == FSE_OK && fi.size == 32)
+    if(storage_common_stat(s->storage, HONE_SEALED_PATH, &fi) == FSE_OK && fi.size == 92 &&
+       read_file(s->storage, HONE_SEALED_PATH, blob, 92)) {
+        /* unseal only when the blob changed: X25519 twice costs a moment */
+        static uint8_t last_blob_hash[32];
+        static bool last_ok;
+        uint8_t bh[32];
+        mbedtls_sha256(blob, 92, bh, 0);
+        bool same = memcmp(bh, last_blob_hash, 32) == 0;
+        if(same && last_ok && s->seed_ok) return; /* same blob, seed already in RAM */
+        if(!same) {
+            ok = seed_unseal(s, blob, buf);
+            if(!ok) FURI_LOG_W(TAG, "id: sealed seed does not open with this device key");
+            memcpy(last_blob_hash, bh, 32);
+            last_ok = ok;
+        }
+    }
+    if(!ok && storage_common_stat(s->storage, HONE_SEED_PATH, &fi) == FSE_OK && fi.size == 32)
         ok = read_file(s->storage, HONE_SEED_PATH, buf, 32);
     furi_check(furi_mutex_acquire(s->seed_lock, FuriWaitForever) == FuriStatusOk);
     if(ok != s->seed_ok || (ok && memcmp(buf, s->id_seed, 32) != 0)) {
@@ -264,31 +355,63 @@ static void seed_load(HoneSrv* s) {
             memset(s->id_seed, 0, 32);
         }
         s->seed_ok = ok;
-        FURI_LOG_I(TAG, ok ? "rid: seed provisioned" : "rid: no seed, rid advert off");
+        s->seed_gen++;
+        FURI_LOG_I(TAG, ok ? "id: seed provisioned" : "id: no seed, id advert off");
     }
     furi_mutex_release(s->seed_lock);
     memset(buf, 0, sizeof(buf));
 }
 
-/* rid = HMAC-SHA256(id_seed, "hone-rid" || window as u64 BE)[0..16] (spec 1a,
- * same bytes as the Android Rid.kt). The advert address for the window is
- * HMAC-SHA256(id_seed, "hone-adr" || window)[0..6] as a random static address,
- * so it changes at the same instant as the rid and is unlinkable across windows. */
-static bool rid_for(HoneSrv* s, uint32_t window, uint8_t rid[16], uint8_t addr[6]) {
-    uint8_t w[8] = {0, 0, 0, 0, window >> 24, window >> 16, window >> 8, window};
-    uint8_t d[32];
+/* Window key (Android IdKeys.kt, spec 1a, Find My model):
+ *   period  = UTC calendar month of the window start, year*12 + (month-1)
+ *   share_k = HKDF(id_seed, "hone-share" || period_be32)
+ *   sk_w    = HKDF(share_k, "hone-pkw" || window_be64), pk_w = X25519(sk_w, 9)
+ *   tag     = HKDF(share_k, "hone-tag" || window_be64)[0..2]
+ * plus, Flipper only, the two advert addresses for the window:
+ *   HKDF(share_k, "hone-adr" || window_be64)[0..12], each 6 bytes as a random
+ *   static address, so the addresses change at the same instant as pk_w. */
+typedef struct {
+    uint32_t window;
+    uint32_t seed_gen;
+    bool valid;
+    uint8_t pk[32];
+    uint8_t tag[2];
+    uint8_t addr[2][6];
+} HoneWindowKey;
+
+static bool window_key(HoneSrv* s, uint32_t window, HoneWindowKey* k) {
+    if(k->valid && k->window == window && k->seed_gen == s->seed_gen) return true;
+    DateTime dt;
+    datetime_timestamp_to_datetime(window * HONE_WINDOW_S, &dt);
+    uint32_t period = (uint32_t)dt.year * 12u + (dt.month - 1u);
+    uint8_t p_be[4] = {period >> 24, period >> 16, period >> 8, period};
+    uint8_t w_be[8] = {0, 0, 0, 0, window >> 24, window >> 16, window >> 8, window};
+    uint8_t share[32], sk[32], adr[12];
+
     furi_check(furi_mutex_acquire(s->seed_lock, FuriWaitForever) == FuriStatusOk);
     bool ok = s->seed_ok;
-    if(ok) {
-        hmac_sha256(s->id_seed, 32, (const uint8_t*)"hone-rid", 8, w, 8, d);
-        memcpy(rid, d, 16);
-        hmac_sha256(s->id_seed, 32, (const uint8_t*)"hone-adr", 8, w, 8, d);
-        memcpy(addr, d, 6);
-        addr[5] |= 0xC0; /* random static: two top bits set (addr is LSB first) */
-    }
+    uint32_t gen = s->seed_gen;
+    if(ok)
+        hkdf_sha256(s->id_seed, 32, NULL, 0, (const uint8_t*)"hone-share", 10, p_be, 4, share, 32);
     furi_mutex_release(s->seed_lock);
-    memset(d, 0, sizeof(d));
-    return ok;
+    if(!ok) {
+        k->valid = false;
+        return false;
+    }
+    hkdf_sha256(share, 32, NULL, 0, (const uint8_t*)"hone-pkw", 8, w_be, 8, sk, 32);
+    crypto_scalarmult_base(k->pk, sk);
+    hkdf_sha256(share, 32, NULL, 0, (const uint8_t*)"hone-tag", 8, w_be, 8, k->tag, 2);
+    hkdf_sha256(share, 32, NULL, 0, (const uint8_t*)"hone-adr", 8, w_be, 8, adr, 12);
+    for(int i = 0; i < 2; i++) {
+        memcpy(k->addr[i], adr + 6 * i, 6);
+        k->addr[i][5] |= 0xC0; /* random static: two top bits set (LSB first) */
+    }
+    k->window = window;
+    k->seed_gen = gen;
+    k->valid = true;
+    memset(share, 0, sizeof(share));
+    memset(sk, 0, sizeof(sk));
+    return true;
 }
 
 /* K_day: fresh random key per UTC day, RAM only. Copies the current key out. */
@@ -1039,6 +1162,13 @@ typedef struct {
     uint8_t scans;
     HoneSighting sight[HONE_BLE_SIGHT_MAX];
     uint8_t sight_n;
+    /* 'hK' legacy halves waiting for their other half, joined by (win8, tag) */
+    struct {
+        uint8_t win8, tag[2], have;
+        int8_t rssi;
+        uint8_t pk[32];
+    } half[8];
+    uint8_t half_next;
     /* today */
     uint32_t day;
     uint32_t* day_fp;
@@ -1086,8 +1216,38 @@ static void sight_note(HoneBle* b, uint8_t kind, uint8_t win8, const uint8_t* id
     memcpy(e->id, id, id_len);
 }
 
+static void ble_half(HoneBle* b, const uint8_t* m, int8_t rssi) {
+    /* m: 'h' 'K' 02 win8 frag tag[2] pk16 */
+    uint8_t idx = m[4] >> 4, win8 = m[3];
+    for(uint8_t i = 0; i < COUNT_OF(b->half); i++) {
+        if(b->half[i].have && b->half[i].win8 == win8 && memcmp(b->half[i].tag, m + 5, 2) == 0) {
+            memcpy(b->half[i].pk + 16 * idx, m + 7, 16);
+            b->half[i].have |= 1 << idx;
+            if(rssi > b->half[i].rssi) b->half[i].rssi = rssi;
+            if(b->half[i].have == 3) {
+                uint8_t lid[32];
+                mbedtls_sha256(b->half[i].pk, 32, lid, 0);
+                sight_note(b, HoneSightLookup, win8, lid, 16, b->half[i].rssi);
+                b->half[i].have = 0;
+            }
+            return;
+        }
+    }
+    uint8_t i = b->half_next++ % COUNT_OF(b->half);
+    b->half[i].win8 = win8;
+    memcpy(b->half[i].tag, m + 5, 2);
+    memset(b->half[i].pk, 0, 32);
+    memcpy(b->half[i].pk + 16 * idx, m + 7, 16);
+    b->half[i].have = 1 << idx;
+    b->half[i].rssi = rssi;
+}
+
 /* HONE adverts inside one report (manufacturer data, company 0xFFFF):
- *   'h' 'R' 0x01 win8 rid[16]       rotating rid (Android SIGHTINGS.md v1, this firmware)
+ *   'h' 'K' 02 win8 frag tag[2] pk  window key (Android IdAdvertiser, this firmware):
+ *                                   lookup id = sha256(pk_w)[0..16]. Legacy halves
+ *                                   (frag 0x02/0x12) are joined; extended (0x01) is
+ *                                   not received by this stack.
+ *   'h' 'R' 0x01 win8 rid[16]       older rid advert (Android SIGHTINGS.md v1)
  *   'H' 'A' seq idx|total frame...  Flipper announce; fragment 0 carries the header
  *                                   (magic 2, type 1, len 1, device_id 8) */
 static void ble_hone_parse(HoneBle* b, const GapObserverReport* r) {
@@ -1100,7 +1260,14 @@ static void ble_hone_parse(HoneBle* b, const GapObserverReport* r) {
         if(ad[0] == 0xFF && l >= 5 && ad[1] == 0xFF && ad[2] == 0xFF) {
             const uint8_t* m = ad + 3;
             size_t ml = l - 3;
-            if(ml >= 20 && m[0] == 'h' && m[1] == 'R' && m[2] == 0x01) {
+            if(ml >= 23 && m[0] == 'h' && m[1] == 'K' && m[2] == 0x02 &&
+               (m[4] & 0x0F) == 2 && (m[4] >> 4) < 2) {
+                ble_half(b, m, r->rssi);
+            } else if(ml >= 39 && m[0] == 'h' && m[1] == 'K' && m[2] == 0x02 && m[4] == 0x01) {
+                uint8_t lid[32];
+                mbedtls_sha256(m + 7, 32, lid, 0);
+                sight_note(b, HoneSightLookup, m[3], lid, 16, r->rssi);
+            } else if(ml >= 20 && m[0] == 'h' && m[1] == 'R' && m[2] == 0x01) {
                 sight_note(b, HoneSightRid, m[3], m + 4, 16, r->rssi);
             } else if(ml >= 4 + 12 && m[0] == 'H' && m[1] == 'A' && (m[3] >> 4) == 0 &&
                       m[4] == HONE_V2_MAGIC0 && m[5] == HONE_V2_MAGIC1) {
@@ -1187,6 +1354,7 @@ static void ble_close_window(HoneBle* b, uint32_t day) {
     b->win_returning = 0;
     b->scans = 0;
     b->sight_n = 0;
+    memset(b->half, 0, sizeof(b->half));
     memset(&b->crowd, 0, sizeof(b->crowd));
 }
 
@@ -1323,35 +1491,39 @@ static void send_fragments(
     }
 }
 
-/* ─── rotating rid advert (spec 1a) ───────────────────────────────────────
- * The beacon is time-shared: HA/HC fragments on the fixed HONE address, then
- * the rid advert on its own per-window random static address. Both rid and
- * address are derived from (seed, window) at the start of every slot and the
- * slot is cut at the quarter-hour, so they change together at the boundary.
- * Format (same as the Android advert, SIGHTINGS.md v1):
- *   [0x17][0xFF][0xFF 0xFF]['h']['R'][0x01][win8][rid 16] */
-#define HONE_RID_SLOT_MS 1500u
+/* ─── rotating id advert (spec 1a) ────────────────────────────────────────
+ * The beacon is time-shared: HA fragments + one HC commit on the fixed HONE
+ * address, then the window key advert. pk_w and both advert addresses are
+ * derived from (seed, window) at the start of every slot and the slot is cut at
+ * the quarter-hour, so key and address change together at the boundary.
+ * Format = Android IdAdvertiser legacy fallback, two adverts joined by (win8, tag):
+ *   [0x1A][0xFF][0xFF 0xFF]['h']['K'][0x02][win8][0x02 | 0x12][tag 2][pk_w 16 of 32]
+ * Each half goes out on its own address (one per half, like Android's two sets),
+ * so observers that filter duplicates per address still get both. */
+#define HONE_ID_HALF_MS 800u
 
-static void rid_slot(HoneSrv* s, const GapExtraBeaconConfig* home, bool* started) {
+static void id_slot(HoneSrv* s, HoneWindowKey* key, const GapExtraBeaconConfig* home, bool* started) {
     uint32_t utc = utc_now(s);
     uint32_t window = utc / HONE_WINDOW_S;
-    uint8_t rid[16];
-    GapExtraBeaconConfig cfg = *home;
-    if(!rid_for(s, window, rid, cfg.address)) return;
-    cfg.address_type = GapAddressTypeRandom;
-
-    uint8_t adv[24] = {0x17, 0xFF, 0xFF, 0xFF, 'h', 'R', 0x01, (uint8_t)(window & 0xFF)};
-    memcpy(adv + 8, rid, 16);
-    memset(rid, 0, sizeof(rid));
-
-    uint32_t to_boundary_ms = (HONE_WINDOW_S - utc % HONE_WINDOW_S) * 1000u;
-    uint32_t hold = MIN(HONE_RID_SLOT_MS, to_boundary_ms);
+    if(!window_key(s, window, key)) return;
+    uint32_t left_ms = (HONE_WINDOW_S - utc % HONE_WINDOW_S) * 1000u;
     if(*started) furi_hal_bt_extra_beacon_stop();
     *started = false;
-    if(furi_hal_bt_extra_beacon_set_config(&cfg) && furi_hal_bt_extra_beacon_set_data(adv, sizeof(adv)) &&
-       furi_hal_bt_extra_beacon_start()) {
-        furi_delay_ms(hold);
-        furi_hal_bt_extra_beacon_stop();
+    for(uint8_t half = 0; half < 2 && left_ms; half++) {
+        GapExtraBeaconConfig cfg = *home;
+        cfg.address_type = GapAddressTypeRandom;
+        memcpy(cfg.address, key->addr[half], 6);
+        uint8_t adv[27] = {
+            0x1A, 0xFF, 0xFF, 0xFF, 'h', 'K', 0x02, (uint8_t)(window & 0xFF),
+            (uint8_t)((half << 4) | 2), key->tag[0], key->tag[1]};
+        memcpy(adv + 11, key->pk + 16 * half, 16);
+        uint32_t hold = MIN(HONE_ID_HALF_MS, left_ms);
+        if(furi_hal_bt_extra_beacon_set_config(&cfg) &&
+           furi_hal_bt_extra_beacon_set_data(adv, sizeof(adv)) && furi_hal_bt_extra_beacon_start()) {
+            furi_delay_ms(hold);
+            furi_hal_bt_extra_beacon_stop();
+        }
+        left_ms -= hold;
     }
     /* back to the HONE address; send_fragments restarts the beacon */
     furi_hal_bt_extra_beacon_set_config(home);
@@ -1384,6 +1556,7 @@ static int32_t announce_lane(void* ctx) {
     uint8_t seq = 0;
     uint8_t rr = 0;
     bool started = false;
+    HoneWindowKey idkey = {0};
     while(1) {
         if(s->beacon_hold) {
             if(started) furi_hal_bt_extra_beacon_stop();
@@ -1419,7 +1592,7 @@ static int32_t announce_lane(void* ctx) {
             send_fragments(adv, 'C', c->seq, c->data, HONE_COMMIT_LEN, &started);
             break;
         }
-        if(s->seed_ok) rid_slot(s, &cfg, &started);
+        if(s->seed_ok) id_slot(s, &idkey, &cfg, &started);
     }
     return 0;
 }

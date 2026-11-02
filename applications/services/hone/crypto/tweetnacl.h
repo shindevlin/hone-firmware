@@ -7,7 +7,7 @@
  * Tanja Lange, Peter Schwabe, Sjaak Smetsers
  * https://tweetnacl.cr.yp.to/
  *
- * Selected subset: ed25519 sign/verify (crypto_sign_*)
+ * Selected subset: ed25519 sign/verify (crypto_sign_*), X25519 (crypto_scalarmult*)
  *
  * Callers must provide:
  *   void randombytes(uint8_t *x, uint64_t xlen);
@@ -27,5 +27,11 @@ extern int crypto_sign(uint8_t *sm, uint64_t *smlen,
 extern int crypto_sign_open(uint8_t *m, uint64_t *mlen,
                             const uint8_t *sm, uint64_t smlen,
                             const uint8_t *pk);
+
+/* X25519: q = n * p (n clamped), q = n * 9 */
+extern int crypto_scalarmult(uint8_t *q, const uint8_t *n, const uint8_t *p);
+extern int crypto_scalarmult_base(uint8_t *q, const uint8_t *n);
+/* SHA-512 */
+extern int crypto_hash_sha512(uint8_t *out, const uint8_t *m, uint64_t n);
 
 #endif /* TWEETNACL_H */
