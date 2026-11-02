@@ -28,6 +28,7 @@
 #include <furi_hal_subghz.h>
 #include <furi_hal_power.h>
 #include <furi_hal_adc.h>
+#include <furi_hal_rtc.h>
 #include <storage/storage.h>
 #include <string.h>
 
@@ -59,10 +60,11 @@
 #define HONE_CTR_PATH    HONE_DIR "/counter.bin"
 #define HONE_ANCHOR_PATH HONE_DIR "/anchor.bin"
 #define HONE_QUEUE_PATH  HONE_DIR "/queue.bin"
-#define HONE_QUEUE_OLD   HONE_DIR "/queue.old"
+#define HONE_ARCHIVE_DIR HONE_DIR "/archive" /* rotated queues, never deleted */
 #define HONE_MAINT_PATH  HONE_DIR "/maintenance"
 #define HONE_OWNER_PATH  HONE_DIR "/owner.txt" /* chain account name, set at claim */
 #define HONE_COMMIT_PATH HONE_DIR "/commits.bin" /* every signed batch commit, appended */
+#define HONE_COMMIT_TIME HONE_DIR "/commits.time" /* u32 RTC per commits.bin record, same order */
 
 /* ─── batch commits ───────────────────────────────────────────────────────
  * Readings are grouped per enrolled sensor id (flipper-<devid>-<group>). Every
@@ -94,7 +96,7 @@ typedef struct {
 } HoneCommit;
 
 #define HONE_CTR_RESERVE  1000u          /* counter block persisted ahead */
-#define HONE_QUEUE_MAX    (1024u * 1024u) /* rotate queue at 1 MB */
+#define HONE_QUEUE_MAX    (4u * 1024u * 1024u) /* rotate queue.bin into archive/ at 4 MB */
 #define HONE_SLOT_MS      2000u          /* capture window per slot */
 #define HONE_RSSI_GAP_MS  50u            /* RSSI sample spacing inside window */
 
@@ -195,8 +197,12 @@ static void queue_append(HoneSrv* s, const uint8_t* frame, size_t len) {
     FileInfo fi;
     if(storage_common_stat(s->storage, HONE_QUEUE_PATH, &fi) == FSE_OK &&
        fi.size > HONE_QUEUE_MAX) {
-        storage_common_remove(s->storage, HONE_QUEUE_OLD);
-        storage_common_rename(s->storage, HONE_QUEUE_PATH, HONE_QUEUE_OLD);
+        /* Keep every rotated queue: it is the evidence the signed batch hashes
+         * commit to, and the SD card has room for years of it. */
+        char path[64];
+        storage_common_mkdir(s->storage, HONE_ARCHIVE_DIR);
+        snprintf(path, sizeof(path), HONE_ARCHIVE_DIR "/q-%lu.bin", (unsigned long)furi_hal_rtc_get_timestamp());
+        storage_common_rename(s->storage, HONE_QUEUE_PATH, path);
     }
     File* f = storage_file_alloc(s->storage);
     if(storage_file_open(f, HONE_QUEUE_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
@@ -637,6 +643,10 @@ static void batches_flush(HoneSrv* s) {
         File* f = storage_file_alloc(s->storage);
         if(storage_file_open(f, HONE_COMMIT_PATH, FSAM_WRITE, FSOM_OPEN_APPEND))
             storage_file_write(f, c->data, HONE_COMMIT_LEN);
+        storage_file_close(f);
+        uint32_t now = furi_hal_rtc_get_timestamp();
+        if(storage_file_open(f, HONE_COMMIT_TIME, FSAM_WRITE, FSOM_OPEN_APPEND))
+            storage_file_write(f, &now, sizeof(now));
         storage_file_close(f);
         storage_file_free(f);
         FURI_LOG_I(TAG, "commit %s x%u", hone_group_name[g], (unsigned)count);
