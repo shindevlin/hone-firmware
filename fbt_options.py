@@ -19,7 +19,7 @@ DEBUG = 1
 DIST_SUFFIX = "local"
 
 # Coprocessor firmware
-COPRO_OB_DATA = "scripts/ob.data"
+COPRO_OB_DATA = "scripts/ob_custradio.data"
 
 # Must match lib/stm32wb_copro version
 COPRO_CUBE_VERSION = "1.20.0"
@@ -27,9 +27,13 @@ COPRO_CUBE_VERSION = "1.20.0"
 COPRO_CUBE_DIR = "lib/stm32wb_copro"
 
 # Default radio stack
-COPRO_STACK_BIN = "stm32wb5x_BLE_Stack_light_fw.bin"
-# Firmware also supports "ble_full", but it might not fit into debug builds
-COPRO_STACK_TYPE = "ble_light"
+# HONE: full stack, for the GAP observer role (passive BLE scanning). The light
+# stack is peripheral-only and cannot scan. Costs 36 KB of shared flash
+# (stack at 0x080CE000 instead of 0x080D7000), taken from the internal storage.
+# ob_custradio.data leaves SFSA/SRAM2 secure boundaries to the installed stack.
+COPRO_STACK_BIN = "stm32wb5x_BLE_Stack_full_fw.bin"
+# Firmware also supports "ble_light"; "ble_full" might not fit into debug builds
+COPRO_STACK_TYPE = "ble_full"
 
 # Leave 0 to let scripts automatically calculate it
 COPRO_STACK_ADDR = "0x0"

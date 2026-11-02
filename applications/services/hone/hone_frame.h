@@ -28,7 +28,7 @@
 #define HONE_DEVICE_ID_LEN 8
 #define HONE_ANCHOR_LEN  8
 #define HONE_SIG_LEN     64
-#define HONE_MAX_BODY    64
+#define HONE_MAX_BODY    128 /* frame <= 224 bytes, fits the u8 queue length */
 
 typedef enum {
     HoneMsgSubGhz    = 0x01,
@@ -39,6 +39,9 @@ typedef enum {
     HoneMsgIr        = 0x06,
     HoneMsgWifi      = 0x07,
     HoneMsgAnnounce  = 0x08, /* broadcast only, never queued */
+    HoneMsgBleCrowd  = 0x09, /* BLE observer: crowd count per scan / window */
+    HoneMsgSighting  = 0x0A, /* BLE observer: other HONE devices heard in a window */
+    HoneMsgWifi2     = 0x0B, /* Wi-Fi dev board body v2 (top APs as oids) */
 } HoneMsgType;
 
 typedef struct __attribute__((packed)) {
@@ -103,6 +106,80 @@ typedef struct __attribute__((packed)) {
     uint8_t  uniq;        /* distinct probe senders (upper bound: MAC randomisation) */
 } HoneBodyWifi;
 
+/* ─── privacy-keyed ids ───────────────────────────────────────────────────
+ * oid = HMAC-SHA256(K, mac)[0..8]. K is random per UTC day, held in RAM only,
+ * never stored or sent (spec 1b), so oids repeat within one day on this device
+ * and cannot be linked across days or devices. BLE uses K_day itself; the Wi-Fi
+ * board gets the subkey HMAC-SHA256(K_day, "hone-wifi"). */
+#define HONE_OID_LEN 8
+
+/* UTC quarter-hour window, the spec's aggregation and rotation unit. */
+#define HONE_WINDOW_S 900u
+
+/* BLE crowd (0x09). One frame per scan (about once a minute); the last frame of
+ * a window has HONE_CROWD_FINAL set and carries that window's totals. */
+#define HONE_CROWD_FINAL      (1u << 0)
+#define HONE_CROWD_NO_OBSERVER (1u << 1) /* radio stack cannot scan: counts are 0 */
+typedef struct __attribute__((packed)) {
+    uint8_t  ver;           /* 1 */
+    uint8_t  flags;
+    uint32_t window;        /* floor(unix_utc / 900) */
+    uint16_t scan_ms;       /* listening time of this scan */
+    uint16_t seen;          /* distinct advertisers (oids) this scan */
+    uint16_t win_distinct;  /* distinct advertisers this window so far */
+    uint16_t win_returning; /* of those, also seen in an earlier window today (dwell) */
+    uint16_t random_addr;   /* this scan: advertisers using a random address */
+    uint16_t reports;       /* advertising reports received this scan */
+    uint8_t  rssi_hist[7];  /* this scan, per advertiser: <-90,-90..-81,-80..-71,
+                               -70..-61,-60..-51,-50..-41,>=-40 dBm (phone bins) */
+    int8_t   rssi_max;      /* this scan, 0 if none */
+    uint8_t  hone_rids;     /* distinct HONE rids this window */
+    uint8_t  hone_flippers; /* distinct HONE Flipper ids (HA announce) this window */
+    uint8_t  scans;         /* scans in this window so far */
+} HoneBodyBleCrowd; /* 29 bytes */
+
+/* HONE sightings (0x0A). Emitted when a window closes, 5 entries per frame. */
+typedef enum {
+    HoneSightRid     = 1, /* rotating rid advert ('hR' v1): id = rid[16] */
+    HoneSightFlipper = 2, /* HONE Flipper announce ('HA'): id = device_id[8], rest 0 */
+    HoneSightLookup  = 3, /* per-window key advert: id = lookup id sha256(pk_w)[0..16] */
+} HoneSightKind;
+typedef struct __attribute__((packed)) {
+    uint8_t kind;     /* HoneSightKind */
+    uint8_t win8;     /* window & 0xFF claimed by the advert (rid kinds), else 0 */
+    int8_t  rssi_max;
+    uint8_t hits;     /* scans it was heard in this window */
+    uint8_t id[16];
+} HoneSighting; /* 20 bytes */
+#define HONE_SIGHTINGS_PER_FRAME 5
+typedef struct __attribute__((packed)) {
+    uint8_t      ver;    /* 1 */
+    uint32_t     window; /* floor(unix_utc / 900), observer clock */
+    uint8_t      n;
+    HoneSighting s[HONE_SIGHTINGS_PER_FRAME]; /* only n are sent */
+} HoneBodySighting; /* 6 + 20n bytes */
+
+/* Wi-Fi body v2 (0x0B), spec 2b. One scan a minute + ~15 s probe listening on
+ * channels 1/6/11. No SSID, BSSID or client MAC: APs and probe senders are oids. */
+typedef struct __attribute__((packed)) {
+    uint8_t oid[HONE_OID_LEN];
+    int8_t  rssi;
+    uint8_t channel;
+} HoneWifiAp; /* 10 bytes */
+#define HONE_WIFI_TOP 8
+typedef struct __attribute__((packed)) {
+    uint8_t    ver;           /* 2 */
+    uint8_t    aps;           /* access points seen (2.4 GHz) */
+    uint8_t    la_aps;        /* of those, locally administered BSSID (phone hotspots / mobile APs) */
+    int8_t     best_rssi;     /* strongest AP, dBm (0 if none) */
+    uint16_t   probes;        /* probe requests heard */
+    uint8_t    probe_senders; /* distinct probe senders (oids; MAC randomisation makes it an upper bound) */
+    uint8_t    listen_s;      /* probe listening time, s */
+    uint8_t    ch[13];        /* APs per channel 1..13 */
+    uint8_t    n_top;
+    HoneWifiAp top[HONE_WIFI_TOP]; /* strongest first; only n_top are sent */
+} HoneBodyWifi2; /* 22 + 10 n_top bytes */
+
 /* Signed announce, broadcast over BLE so any HONE device in range can verify
  * who this is without pairing. Carries the full public key; the chain's
  * device registration says who owns it. */
@@ -112,6 +189,8 @@ typedef struct __attribute__((packed)) {
 #define HONE_CAP_IBUTTON (1u << 3)
 #define HONE_CAP_IR      (1u << 4)
 #define HONE_CAP_WIFI    (1u << 5) /* dev board answered recently */
+#define HONE_CAP_BLE_OBS (1u << 6) /* BLE observer running (full radio stack) */
+#define HONE_CAP_RID     (1u << 7) /* id_seed provisioned: rotating rid advert on */
 #define HONE_FLAG_EXT_POWER (1u << 0)
 #define HONE_FLAG_PAUSED    (1u << 1)
 typedef struct __attribute__((packed)) {

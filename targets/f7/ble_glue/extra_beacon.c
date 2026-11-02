@@ -83,6 +83,7 @@ bool gap_extra_beacon_start(void) {
         (uint8_t)config->adv_power_level);
     if(status) {
         FURI_LOG_E(TAG, "Failed to start: 0x%x", status);
+        furi_mutex_release(extra_beacon.state_mutex);
         return false;
     }
     extra_beacon.extra_beacon_state = GapExtraBeaconStateStarted;
@@ -104,6 +105,7 @@ bool gap_extra_beacon_stop(void) {
     tBleStatus status = aci_gap_additional_beacon_stop();
     if(status) {
         FURI_LOG_E(TAG, "Failed to stop: 0x%x", status);
+        furi_mutex_release(extra_beacon.state_mutex);
         return false;
     }
     extra_beacon.extra_beacon_state = GapExtraBeaconStateStopped;

@@ -3,6 +3,9 @@
 #include "app_common.h"
 #include <core/mutex.h>
 #include "furi_ble/event_dispatcher.h"
+#include "gap_observer.h"
+#include "ble_glue.h"
+#include <interface/patterns/ble_thread/shci/shci.h>
 #include <ble/ble.h>
 
 #include <furi_hal.h>
@@ -151,6 +154,10 @@ BleEventFlowStatus ble_event_app_notification(void* pckt) {
     case HCI_LE_META_EVT_CODE:
         meta_evt = (evt_le_meta_event*)event_pckt->data;
         switch(meta_evt->subevent) {
+        case HCI_LE_ADVERTISING_REPORT_SUBEVT_CODE:
+            if(event_pckt->plen > 1)
+                gap_observer_on_adv_report(meta_evt->data, event_pckt->plen - 1);
+            break;
         case HCI_LE_CONNECTION_UPDATE_COMPLETE_SUBEVT_CODE: {
             hci_le_connection_update_complete_event_rp0* event =
                 (hci_le_connection_update_complete_event_rp0*)meta_evt->data;
@@ -356,8 +363,13 @@ static void gap_init_svc(Gap* gap, const GapRootSecurityKeys* root_keys) {
     // Initialize GAP interface
     // Skip fist symbol AD_TYPE_COMPLETE_LOCAL_NAME
     char* name = gap->service.adv_name + 1;
+    // Full stack: also take the observer role so services can scan passively
+    uint8_t gap_role = GAP_PERIPHERAL_ROLE;
+    if(ble_glue_get_c2_info()->StackType == INFO_STACK_TYPE_BLE_FULL) {
+        gap_role |= GAP_OBSERVER_ROLE;
+    }
     aci_gap_init(
-        GAP_PERIPHERAL_ROLE,
+        gap_role,
         0,
         strlen(name),
         &gap->service.gap_svc_handle,

@@ -4,8 +4,12 @@
  * HONE is the only owner of the Flipper's sensors. Three lanes, each its own
  * thread and stack:
  *   - Sub-GHz lane: continuous RSSI windows (SPI only, no timers)
- *   - Wi-Fi lane: dev board scans (separate MCU on USART), continuous on
- *     external power, once a minute on battery
+ *   - Wi-Fi lane: dev board scans (separate MCU on USART), once a minute on
+ *     battery and on USB: one AP scan + ~15 s probe listening (body v2)
+ *   - BLE lane: passive scan window every minute (needs the full radio stack):
+ *     crowd count as day-keyed oids, and sightings of other HONE devices
+ *   - announce lane: signed HA announce + HC batch commits, and the rotating
+ *     rid advert ('hR') on its own address, both rotating at UTC quarter-hours
  *   - tag lane (service thread): rotates NFC (+IR), iButton (+IR), RFID, IR,
  *     heartbeat. NFC and iButton both need TIM1 and RFID needs TIM1+TIM2, so
  *     only one of them runs at a time; IR receive (TIM2 only) rides along
@@ -49,10 +53,12 @@
 #include <furi_hal_bt.h>
 #include <furi_hal_version.h>
 #include <bt/bt_service/bt.h>
+#include <gap_observer.h>
+#include <furi_hal_random.h>
 #include <stdlib.h>
 
 #define TAG "HoneSrv"
-#define HONE_FW_VERSION "2.0.0"
+#define HONE_FW_VERSION "2.1.0"
 
 #define HONE_DIR         EXT_PATH("apps_data/hone")
 #define HONE_KEY_PATH    HONE_DIR "/identity.key"
@@ -65,6 +71,14 @@
 #define HONE_OWNER_PATH  HONE_DIR "/owner.txt" /* chain account name, set at claim */
 #define HONE_COMMIT_PATH HONE_DIR "/commits.bin" /* every signed batch commit, appended */
 #define HONE_COMMIT_TIME HONE_DIR "/commits.time" /* u32 RTC per commits.bin record, same order */
+/* Rotating-id seed (spec 1a): 32 raw bytes, written by the owner's phone at claim
+ * time (derived from the wallet hide key) over USB or BLE RPC storage write.
+ * Never logged or sent. No file = no rid advert. Deleting it stops the advert. */
+#define HONE_SEED_PATH   HONE_DIR "/id_seed"
+/* The Flipper RTC keeps LOCAL time. Offset of local time from UTC, in minutes,
+ * as text (e.g. "-360"). Missing file = HONE_UTC_OFFSET_DEFAULT. */
+#define HONE_TZ_PATH     HONE_DIR "/utc_offset_min"
+#define HONE_UTC_OFFSET_DEFAULT (-360) /* America/El_Salvador, UTC-6, no DST */
 
 /* ─── batch commits ───────────────────────────────────────────────────────
  * Readings are grouped per enrolled sensor id (flipper-<devid>-<group>). Every
@@ -74,14 +88,18 @@
  * broadcast over BLE ('HC'), so any HONE phone in range can submit it to the
  * chain from anywhere; the frames themselves stay in queue.bin as the evidence
  * batch_hash commits to. */
-#define HONE_GROUPS        4
+#define HONE_GROUPS        6
 #define HONE_BATCH_MS      60000u
 #define HONE_BATCH_MAX     60u
 #define HONE_COMMIT_LEN    (8 + 1 + 2 + 32 + 64) /* devid, group, count, hash, sig */
 #define HONE_COMMIT_SLOTS  8
 #define HONE_COMMIT_TTL_MS (15u * 60u * 1000u)   /* re-broadcast each commit for 15 min */
-static const char* const hone_group_name[HONE_GROUPS] = {"subghz", "wifi", "tags", "ir"};
-static const char* const hone_group_type[HONE_GROUPS] = {"continuous", "continuous", "event", "event"};
+/* Group index = commits.bin group byte = sensor id flipper-<devid>-<name>.
+ * Append only: indices are on chain. */
+static const char* const hone_group_name[HONE_GROUPS] =
+    {"subghz", "wifi", "tags", "ir", "blecrowd", "sightings"};
+static const char* const hone_group_type[HONE_GROUPS] =
+    {"continuous", "continuous", "event", "event", "continuous", "event"};
 
 typedef struct {
     mbedtls_sha256_context h;
@@ -123,7 +141,23 @@ typedef struct {
     HoneCommit commits[HONE_COMMIT_SLOTS];
     uint8_t commit_next;
     uint8_t commit_seq;
+    /* time */
+    volatile int32_t utc_offset_min;
+    /* rotating id (spec 1a). Seed guarded by seed_lock; never logged. */
+    FuriMutex* seed_lock;
+    uint8_t id_seed[32];
+    volatile bool seed_ok;
+    /* per-day oid key (spec 1b): RAM only, replaced at UTC midnight */
+    FuriMutex* kday_lock;
+    uint8_t k_day[32];
+    uint32_t k_day_day; /* floor(utc / 86400) it belongs to; 0 = unset */
+    volatile bool observer_ok;
 } HoneSrv;
+
+_Static_assert(sizeof(HoneBodyBleCrowd) == 29, "crowd body");
+_Static_assert(sizeof(HoneSighting) == 20, "sighting entry");
+_Static_assert(sizeof(HoneBodySighting) <= HONE_MAX_BODY, "sighting body");
+_Static_assert(sizeof(HoneBodyWifi2) == 102 && sizeof(HoneBodyWifi2) <= HONE_MAX_BODY, "wifi2 body");
 
 /* ─── storage helpers ───────────────────────────────────────────────────── */
 
@@ -143,6 +177,129 @@ static bool write_file(Storage* st, const char* path, const void* buf, size_t le
     storage_file_close(f);
     storage_file_free(f);
     return ok;
+}
+
+static void hex_into(char* out, const uint8_t* in, size_t n) {
+    static const char hx[] = "0123456789abcdef";
+    for(size_t i = 0; i < n; i++) {
+        out[2 * i] = hx[in[i] >> 4];
+        out[2 * i + 1] = hx[in[i] & 15];
+    }
+    out[2 * n] = 0;
+}
+
+/* ─── time, HMAC, keys ─────────────────────────────────────────────────── */
+
+static uint32_t utc_now(const HoneSrv* s) {
+    int64_t t = (int64_t)furi_hal_rtc_get_timestamp() - (int64_t)s->utc_offset_min * 60;
+    return t > 0 ? (uint32_t)t : 0;
+}
+
+static void tz_load(HoneSrv* s) {
+    char buf[12] = {0};
+    File* f = storage_file_alloc(s->storage);
+    int32_t off = HONE_UTC_OFFSET_DEFAULT;
+    if(storage_file_open(f, HONE_TZ_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        size_t n = storage_file_read(f, buf, sizeof(buf) - 1);
+        buf[n] = 0;
+        char* end;
+        long v = strtol(buf, &end, 10);
+        if(end != buf && v >= -14 * 60 && v <= 14 * 60) off = (int32_t)v;
+    }
+    storage_file_close(f);
+    storage_file_free(f);
+    if(off != s->utc_offset_min) {
+        s->utc_offset_min = off;
+        FURI_LOG_I(TAG, "utc offset %ld min", (long)off);
+    }
+}
+
+static void hmac_sha256(
+    const uint8_t* key,
+    size_t key_len,
+    const uint8_t* a,
+    size_t a_len,
+    const uint8_t* b,
+    size_t b_len,
+    uint8_t out[32]) {
+    uint8_t k[64] = {0}, pad[64], inner[32];
+    mbedtls_sha256_context c;
+    if(key_len > 64) {
+        mbedtls_sha256(key, key_len, k, 0);
+    } else {
+        memcpy(k, key, key_len);
+    }
+    for(int i = 0; i < 64; i++) pad[i] = k[i] ^ 0x36;
+    mbedtls_sha256_init(&c);
+    mbedtls_sha256_starts(&c, 0);
+    mbedtls_sha256_update(&c, pad, 64);
+    if(a_len) mbedtls_sha256_update(&c, a, a_len);
+    if(b_len) mbedtls_sha256_update(&c, b, b_len);
+    mbedtls_sha256_finish(&c, inner);
+    for(int i = 0; i < 64; i++) pad[i] = k[i] ^ 0x5c;
+    mbedtls_sha256_starts(&c, 0);
+    mbedtls_sha256_update(&c, pad, 64);
+    mbedtls_sha256_update(&c, inner, 32);
+    mbedtls_sha256_finish(&c, out);
+    mbedtls_sha256_free(&c);
+    memset(k, 0, sizeof(k));
+    memset(pad, 0, sizeof(pad));
+    memset(inner, 0, sizeof(inner));
+}
+
+/* Load or drop the id seed. Called every few seconds; touches RAM only on change. */
+static void seed_load(HoneSrv* s) {
+    uint8_t buf[32];
+    bool ok = false;
+    FileInfo fi;
+    if(storage_common_stat(s->storage, HONE_SEED_PATH, &fi) == FSE_OK && fi.size == 32)
+        ok = read_file(s->storage, HONE_SEED_PATH, buf, 32);
+    furi_check(furi_mutex_acquire(s->seed_lock, FuriWaitForever) == FuriStatusOk);
+    if(ok != s->seed_ok || (ok && memcmp(buf, s->id_seed, 32) != 0)) {
+        if(ok) {
+            memcpy(s->id_seed, buf, 32);
+        } else {
+            memset(s->id_seed, 0, 32);
+        }
+        s->seed_ok = ok;
+        FURI_LOG_I(TAG, ok ? "rid: seed provisioned" : "rid: no seed, rid advert off");
+    }
+    furi_mutex_release(s->seed_lock);
+    memset(buf, 0, sizeof(buf));
+}
+
+/* rid = HMAC-SHA256(id_seed, "hone-rid" || window as u64 BE)[0..16] (spec 1a,
+ * same bytes as the Android Rid.kt). The advert address for the window is
+ * HMAC-SHA256(id_seed, "hone-adr" || window)[0..6] as a random static address,
+ * so it changes at the same instant as the rid and is unlinkable across windows. */
+static bool rid_for(HoneSrv* s, uint32_t window, uint8_t rid[16], uint8_t addr[6]) {
+    uint8_t w[8] = {0, 0, 0, 0, window >> 24, window >> 16, window >> 8, window};
+    uint8_t d[32];
+    furi_check(furi_mutex_acquire(s->seed_lock, FuriWaitForever) == FuriStatusOk);
+    bool ok = s->seed_ok;
+    if(ok) {
+        hmac_sha256(s->id_seed, 32, (const uint8_t*)"hone-rid", 8, w, 8, d);
+        memcpy(rid, d, 16);
+        hmac_sha256(s->id_seed, 32, (const uint8_t*)"hone-adr", 8, w, 8, d);
+        memcpy(addr, d, 6);
+        addr[5] |= 0xC0; /* random static: two top bits set (addr is LSB first) */
+    }
+    furi_mutex_release(s->seed_lock);
+    memset(d, 0, sizeof(d));
+    return ok;
+}
+
+/* K_day: fresh random key per UTC day, RAM only. Copies the current key out. */
+static void k_day_get(HoneSrv* s, uint8_t out[32], uint32_t* day_out) {
+    uint32_t day = utc_now(s) / 86400u;
+    furi_check(furi_mutex_acquire(s->kday_lock, FuriWaitForever) == FuriStatusOk);
+    if(day != s->k_day_day) {
+        furi_hal_random_fill_buf(s->k_day, sizeof(s->k_day));
+        s->k_day_day = day;
+    }
+    memcpy(out, s->k_day, 32);
+    if(day_out) *day_out = day;
+    furi_mutex_release(s->kday_lock);
 }
 
 static void identity_load_or_create(HoneSrv* s) {
@@ -457,9 +614,11 @@ static bool ir_end(HoneIrRun* r, HoneBodyIr* out) {
 
 #define HONE_WIFI_BAUD    230400
 #define HONE_WIFI_BOOT_MS 4000
-#define HONE_WIFI_SCAN_MS 10000
-#define HONE_WIFI_EVERY_MS 60000 /* on battery: at most one scan a minute (board draws 5 V) */
-#define HONE_EXT_POWER_V   4.5f  /* VBUS above this = USB/external power: scan continuously */
+#define HONE_WIFI_SCAN_MS 10000  /* v1 SCAN reply timeout */
+#define HONE_WIFI_LISTEN_MS 15000 /* v2: continuous probe listening, ch 1/6/11 */
+#define HONE_WIFI2_SCAN_MS (HONE_WIFI_LISTEN_MS + 15000) /* v2 reply timeout */
+#define HONE_WIFI_EVERY_MS 60000 /* one scan a minute, battery and USB alike (spec 2b) */
+#define HONE_EXT_POWER_V   4.5f  /* VBUS above this = USB/external power (announce flag) */
 
 static void wifi_rx_cb(FuriHalSerialHandle* h, FuriHalSerialRxEvent ev, void* ctx) {
     if(ev & FuriHalSerialRxEventData) {
@@ -492,6 +651,56 @@ static int kv_int(const char* line, const char* key) {
     return p ? atoi(p + strlen(key)) : 0;
 }
 
+static int hexval(char c) {
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+           c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+/* "WIFI2 aps=N la=L best=R ch=c1,...,c13 probes=P uniq=U listen=S top=oid:rssi:ch,... ms=T" */
+static bool wifi2_parse(const char* line, HoneBodyWifi2* out) {
+    if(strncmp(line, "WIFI2 ", 6) != 0) return false;
+    memset(out, 0, sizeof(*out));
+    out->ver = 2;
+    out->aps = (uint8_t)MIN(kv_int(line, " aps="), 255);
+    out->la_aps = (uint8_t)MIN(kv_int(line, " la="), 255);
+    out->best_rssi = (int8_t)kv_int(line, " best=");
+    out->probes = (uint16_t)MIN(kv_int(line, " probes="), 0xFFFF);
+    out->probe_senders = (uint8_t)MIN(kv_int(line, " uniq="), 255);
+    out->listen_s = (uint8_t)MIN(kv_int(line, " listen="), 255);
+    const char* p = strstr(line, " ch=");
+    if(p) {
+        p += 4;
+        for(int i = 0; i < 13 && *p && *p != ' '; i++) {
+            out->ch[i] = (uint8_t)MIN(atoi(p), 255);
+            while(*p && *p != ',' && *p != ' ') p++;
+            if(*p == ',') p++;
+        }
+    }
+    p = strstr(line, " top=");
+    if(p) {
+        p += 5;
+        while(out->n_top < HONE_WIFI_TOP && *p && *p != ' ' && *p != '-') {
+            HoneWifiAp* ap = &out->top[out->n_top];
+            int i = 0;
+            for(; i < HONE_OID_LEN; i++) {
+                int hi = hexval(p[0]), lo = hi < 0 ? -1 : hexval(p[1]);
+                if(lo < 0) break;
+                ap->oid[i] = (uint8_t)(hi << 4 | lo);
+                p += 2;
+            }
+            if(i != HONE_OID_LEN || *p != ':') break;
+            ap->rssi = (int8_t)atoi(++p);
+            while(*p && *p != ':' && *p != ' ') p++;
+            if(*p != ':') break;
+            ap->channel = (uint8_t)atoi(++p);
+            while(*p && *p != ',' && *p != ' ') p++;
+            out->n_top++;
+            if(*p == ',') p++;
+        }
+    }
+    return true;
+}
+
 static bool wifi_parse(const char* line, HoneBodyWifi* out) {
     if(strncmp(line, "WIFI ", 5) != 0) return false;
     memset(out, 0, sizeof(*out));
@@ -511,7 +720,9 @@ static bool wifi_parse(const char* line, HoneBodyWifi* out) {
     return true;
 }
 
-static bool capture_wifi(HoneBodyWifi* out) {
+/* One dev board session. hone-esp >= 0.2 gets the day's oid subkey and a SCAN2
+ * (body v2, *v2 = true); an older board falls back to the v1 SCAN. */
+static bool capture_wifi(HoneSrv* s, HoneBodyWifi* v1, HoneBodyWifi2* v2, bool* is_v2) {
     bool otg_was_on = furi_hal_power_is_otg_enabled();
     if(!otg_was_on) furi_hal_power_enable_otg();
     FuriHalSerialHandle* h = furi_hal_serial_control_acquire(FuriHalSerialIdUsart);
@@ -519,29 +730,63 @@ static bool capture_wifi(HoneBodyWifi* out) {
         if(!otg_was_on) furi_hal_power_disable_otg();
         return false;
     }
-    FuriStreamBuffer* sb = furi_stream_buffer_alloc(512, 1);
+    FuriStreamBuffer* sb = furi_stream_buffer_alloc(1024, 1);
     furi_hal_serial_init(h, HONE_WIFI_BAUD);
     furi_hal_serial_async_rx_start(h, wifi_rx_cb, sb, false);
 
-    char line[96];
-    bool alive = false, got = false;
+    char* line = malloc(400);
+    bool alive = false, got = false, new_board = false;
+    *is_v2 = false;
     uint32_t start = furi_get_tick();
     while(!alive && furi_get_tick() - start < furi_ms_to_ticks(HONE_WIFI_BOOT_MS)) {
         furi_hal_serial_tx(h, (const uint8_t*)"PING\n", 5);
-        while(wifi_readline(sb, line, sizeof(line), 500)) {
+        while(wifi_readline(sb, line, 400, 500)) {
             if(strncmp(line, "PONG", 4) == 0) {
                 alive = true;
+                /* "PONG hone-esp 0.1.0": 0.1.x only speaks v1 */
+                const char* v = strstr(line, "hone-esp ");
+                new_board = v && strncmp(v + 9, "0.1.", 4) != 0;
                 break;
             }
         }
     }
-    if(alive) {
+    if(alive && new_board) {
+        /* subkey = HMAC(K_day, "hone-wifi"): the board never holds K_day itself */
+        uint8_t k[32], sub[32];
+        char cmd[4 + 64 + 2];
+        k_day_get(s, k, NULL);
+        hmac_sha256(k, 32, (const uint8_t*)"hone-wifi", 9, NULL, 0, sub);
+        memcpy(cmd, "KEY ", 4);
+        hex_into(cmd + 4, sub, 32);
+        cmd[68] = '\n';
+        furi_hal_serial_tx(h, (const uint8_t*)cmd, 69);
+        memset(k, 0, sizeof(k));
+        memset(sub, 0, sizeof(sub));
+        memset(cmd, 0, sizeof(cmd));
+        bool keyed = false;
+        start = furi_get_tick();
+        while(!keyed && furi_get_tick() - start < furi_ms_to_ticks(1000)) {
+            if(wifi_readline(sb, line, 400, 200)) keyed = strncmp(line, "OK key", 6) == 0;
+        }
+        if(keyed) {
+            char sc[24];
+            int n = snprintf(sc, sizeof(sc), "SCAN2 %u\n", (unsigned)HONE_WIFI_LISTEN_MS);
+            furi_hal_serial_tx(h, (const uint8_t*)sc, n);
+            start = furi_get_tick();
+            while(!got && furi_get_tick() - start < furi_ms_to_ticks(HONE_WIFI2_SCAN_MS)) {
+                if(wifi_readline(sb, line, 400, 500)) got = wifi2_parse(line, v2);
+            }
+            *is_v2 = got;
+        }
+    }
+    if(alive && !new_board) {
         furi_hal_serial_tx(h, (const uint8_t*)"SCAN\n", 5);
         start = furi_get_tick();
         while(!got && furi_get_tick() - start < furi_ms_to_ticks(HONE_WIFI_SCAN_MS)) {
-            if(wifi_readline(sb, line, sizeof(line), 500)) got = wifi_parse(line, out);
+            if(wifi_readline(sb, line, 400, 500)) got = wifi_parse(line, v1);
         }
     }
+    free(line);
 
     furi_hal_serial_async_rx_stop(h);
     furi_hal_serial_deinit(h);
@@ -554,11 +799,14 @@ static bool capture_wifi(HoneBodyWifi* out) {
 static int group_of(HoneMsgType t) {
     switch(t) {
     case HoneMsgSubGhz: return 0;
-    case HoneMsgWifi: return 1;
+    case HoneMsgWifi:
+    case HoneMsgWifi2: return 1;
     case HoneMsgRfid:
     case HoneMsgNfc:
     case HoneMsgIButton: return 2;
     case HoneMsgIr: return 3;
+    case HoneMsgBleCrowd: return 4;
+    case HoneMsgSighting: return 5;
     default: return -1;
     }
 }
@@ -583,15 +831,6 @@ static void emit(HoneSrv* s, HoneMsgType type, const void* body, uint8_t body_le
         }
     }
     furi_mutex_release(s->emit_lock);
-}
-
-static void hex_into(char* out, const uint8_t* in, size_t n) {
-    static const char hx[] = "0123456789abcdef";
-    for(size_t i = 0; i < n; i++) {
-        out[2 * i] = hx[in[i] >> 4];
-        out[2 * i + 1] = hx[in[i] & 15];
-    }
-    out[2 * n] = 0;
 }
 
 /* Close any batch that is due: sign the chain's SENSOR_DATA_COMMIT canonical
@@ -743,23 +982,275 @@ static int32_t wifi_lane(void* ctx) {
             continue;
         }
         /* Read VBUS while our 5 V output is off, so it reflects real external power. */
-        bool external = !furi_hal_power_is_otg_enabled() &&
-                        furi_hal_power_get_usb_voltage() > HONE_EXT_POWER_V;
-        s->ext_power = external;
-        if(!external && last && furi_get_tick() - last < furi_ms_to_ticks(HONE_WIFI_EVERY_MS)) {
-            furi_delay_ms(1000); /* on battery: at most one scan a minute */
+        if(!furi_hal_power_is_otg_enabled())
+            s->ext_power = furi_hal_power_get_usb_voltage() > HONE_EXT_POWER_V;
+        /* one scan a minute on battery and on USB alike (spec 2b) */
+        if(last && furi_get_tick() - last < furi_ms_to_ticks(HONE_WIFI_EVERY_MS)) {
+            furi_delay_ms(1000);
             continue;
         }
+        last = furi_get_tick();
         HoneBodyWifi b;
-        if(capture_wifi(&b)) {
-            last = furi_get_tick();
-            s->wifi_ok_tick = last;
-            emit(s, HoneMsgWifi, &b, sizeof(b));
-            FURI_LOG_I(TAG, "wifi aps %u best %d probes %u", b.aps, b.best_rssi, b.probes);
-        } else {
-            last = furi_get_tick();
-            furi_delay_ms(external ? HONE_WIFI_RETRY_MS : HONE_WIFI_EVERY_MS); /* no board */
+        HoneBodyWifi2 b2;
+        bool v2;
+        if(capture_wifi(s, &b, &b2, &v2)) {
+            s->wifi_ok_tick = furi_get_tick();
+            if(v2) {
+                emit(s, HoneMsgWifi2, &b2, (uint8_t)(offsetof(HoneBodyWifi2, top) + b2.n_top * sizeof(HoneWifiAp)));
+                FURI_LOG_I(
+                    TAG, "wifi2 aps %u la %u top %u probes %u senders %u",
+                    b2.aps, b2.la_aps, b2.n_top, b2.probes, b2.probe_senders);
+            } else {
+                emit(s, HoneMsgWifi, &b, sizeof(b));
+                FURI_LOG_I(TAG, "wifi aps %u best %d probes %u", b.aps, b.best_rssi, b.probes);
+            }
         }
+    }
+    return 0;
+}
+
+/* ─── BLE lane: passive observer (spec 1b, 2a crowd, 1a sightings) ───────
+ * Every HONE_BLE_EVERY_MS: a passive scan of HONE_BLE_SCAN_MS with duplicate
+ * filtering (each advertiser reported about once per scan). Reports are copied
+ * off the BLE event thread through a queue; addresses are turned into day-keyed
+ * oids at once and never stored or sent. Needs the full radio stack; with the
+ * light stack the lane only reports HONE_CROWD_NO_OBSERVER once per window. */
+
+#define HONE_BLE_EVERY_MS     60000u
+#define HONE_BLE_SCAN_MS      8000u
+#define HONE_BLE_INTERVAL_MS  100u
+#define HONE_BLE_WINDOW_MS    50u  /* 50 % duty inside the scan: leaves airtime for the adverts */
+#define HONE_BLE_SCAN_SET     160u /* distinct advertisers per scan */
+#define HONE_BLE_WIN_SET      384u /* distinct advertisers per window */
+#define HONE_BLE_DAY_SET      768u /* 4-byte fingerprints of earlier windows today */
+#define HONE_BLE_SIGHT_MAX    20u
+
+typedef struct {
+    HoneSrv* s;
+    FuriMessageQueue* q;
+    uint32_t dropped;
+    /* current window */
+    uint32_t window;
+    uint64_t* win_set;
+    uint16_t win_n;
+    uint16_t win_returning;
+    uint8_t scans;
+    HoneSighting sight[HONE_BLE_SIGHT_MAX];
+    uint8_t sight_n;
+    /* today */
+    uint32_t day;
+    uint32_t* day_fp;
+    uint16_t day_n;
+    /* current scan */
+    uint64_t* scan_set;
+    uint16_t scan_n;
+    HoneBodyBleCrowd crowd;
+} HoneBle;
+
+static void ble_report_cb(const GapObserverReport* r, void* ctx) {
+    HoneBle* b = ctx;
+    if(furi_message_queue_put(b->q, r, 0) != FuriStatusOk) b->dropped++;
+}
+
+static bool set64_add(uint64_t* set, uint16_t* n, uint16_t cap, uint64_t v) {
+    for(uint16_t i = 0; i < *n; i++)
+        if(set[i] == v) return false;
+    if(*n < cap) set[(*n)++] = v;
+    return true;
+}
+
+static bool fp_has(const uint32_t* set, uint16_t n, uint32_t v) {
+    for(uint16_t i = 0; i < n; i++)
+        if(set[i] == v) return true;
+    return false;
+}
+
+static void sight_note(HoneBle* b, uint8_t kind, uint8_t win8, const uint8_t* id, size_t id_len, int8_t rssi) {
+    for(uint8_t i = 0; i < b->sight_n; i++) {
+        HoneSighting* e = &b->sight[i];
+        if(e->kind == kind && memcmp(e->id, id, id_len) == 0) {
+            if(rssi > e->rssi_max) e->rssi_max = rssi;
+            if(e->hits < 255) e->hits++;
+            return;
+        }
+    }
+    if(b->sight_n >= HONE_BLE_SIGHT_MAX) return;
+    HoneSighting* e = &b->sight[b->sight_n++];
+    memset(e, 0, sizeof(*e));
+    e->kind = kind;
+    e->win8 = win8;
+    e->rssi_max = rssi;
+    e->hits = 1;
+    memcpy(e->id, id, id_len);
+}
+
+/* HONE adverts inside one report (manufacturer data, company 0xFFFF):
+ *   'h' 'R' 0x01 win8 rid[16]       rotating rid (Android SIGHTINGS.md v1, this firmware)
+ *   'H' 'A' seq idx|total frame...  Flipper announce; fragment 0 carries the header
+ *                                   (magic 2, type 1, len 1, device_id 8) */
+static void ble_hone_parse(HoneBle* b, const GapObserverReport* r) {
+    const uint8_t* d = r->data;
+    size_t n = r->data_len;
+    for(size_t off = 0; off + 1 < n;) {
+        uint8_t l = d[off];
+        if(!l || off + 1 + l > n) break;
+        const uint8_t* ad = d + off + 1; /* ad[0] = type */
+        if(ad[0] == 0xFF && l >= 5 && ad[1] == 0xFF && ad[2] == 0xFF) {
+            const uint8_t* m = ad + 3;
+            size_t ml = l - 3;
+            if(ml >= 20 && m[0] == 'h' && m[1] == 'R' && m[2] == 0x01) {
+                sight_note(b, HoneSightRid, m[3], m + 4, 16, r->rssi);
+            } else if(ml >= 4 + 12 && m[0] == 'H' && m[1] == 'A' && (m[3] >> 4) == 0 &&
+                      m[4] == HONE_V2_MAGIC0 && m[5] == HONE_V2_MAGIC1) {
+                sight_note(b, HoneSightFlipper, 0, m + 8, HONE_DEVICE_ID_LEN, r->rssi);
+            }
+        }
+        off += 1 + l;
+    }
+}
+
+static void ble_take(HoneBle* b, const GapObserverReport* r, const uint8_t k_day[32]) {
+    b->crowd.reports++;
+    /* oid over the 6 address bytes only (spec 1b: HMAC(K_day, mac)) */
+    uint8_t d[32];
+    hmac_sha256(k_day, 32, r->addr, 6, NULL, 0, d);
+    uint64_t oid;
+    memcpy(&oid, d, sizeof(oid));
+    memset(d, 0, sizeof(d));
+    ble_hone_parse(b, r);
+    if(!set64_add(b->scan_set, &b->scan_n, HONE_BLE_SCAN_SET, oid)) return; /* scan response etc. */
+    if(r->addr_type & 1) b->crowd.random_addr++;
+    if(r->rssi != 127) {
+        int8_t v = r->rssi;
+        int bin = v < -90 ? 0 : v < -80 ? 1 : v < -70 ? 2 : v < -60 ? 3 : v < -50 ? 4 : v < -40 ? 5 : 6;
+        if(b->crowd.rssi_hist[bin] < 255) b->crowd.rssi_hist[bin]++;
+        if(b->crowd.rssi_max == 0 || v > b->crowd.rssi_max) b->crowd.rssi_max = v;
+    }
+    if(set64_add(b->win_set, &b->win_n, HONE_BLE_WIN_SET, oid)) {
+        if(fp_has(b->day_fp, b->day_n, (uint32_t)oid)) b->win_returning++;
+    }
+}
+
+static uint8_t sight_count(const HoneBle* b, uint8_t kind) {
+    uint8_t n = 0;
+    for(uint8_t i = 0; i < b->sight_n; i++)
+        if(b->sight[i].kind == kind) n++;
+    return n;
+}
+
+static void ble_emit_crowd(HoneBle* b, uint8_t flags) {
+    HoneBodyBleCrowd* c = &b->crowd;
+    c->ver = 1;
+    c->flags |= flags;
+    c->window = b->window;
+    c->seen = b->scan_n;
+    c->win_distinct = b->win_n;
+    c->win_returning = b->win_returning;
+    c->hone_rids = sight_count(b, HoneSightRid) + sight_count(b, HoneSightLookup);
+    c->hone_flippers = sight_count(b, HoneSightFlipper);
+    c->scans = b->scans;
+    emit(b->s, HoneMsgBleCrowd, c, sizeof(*c));
+    FURI_LOG_I(
+        TAG, "ble w%lu scan %u win %u ret %u rids %u flippers %u%s",
+        c->window, c->seen, c->win_distinct, c->win_returning, c->hone_rids, c->hone_flippers,
+        (c->flags & HONE_CROWD_FINAL) ? " final" : "");
+}
+
+/* Close the window: final crowd frame, sightings frames, fold the window's
+ * oids into today's fingerprints. */
+static void ble_close_window(HoneBle* b, uint32_t day) {
+    if(b->window && (b->scans || (b->crowd.flags & HONE_CROWD_NO_OBSERVER))) {
+        memset(&b->crowd, 0, sizeof(b->crowd));
+        b->crowd.flags = b->s->observer_ok ? 0 : HONE_CROWD_NO_OBSERVER;
+        b->scan_n = 0;
+        ble_emit_crowd(b, HONE_CROWD_FINAL);
+        for(uint8_t i = 0; i < b->sight_n; i += HONE_SIGHTINGS_PER_FRAME) {
+            HoneBodySighting f = {.ver = 1, .window = b->window};
+            f.n = (uint8_t)MIN((unsigned)HONE_SIGHTINGS_PER_FRAME, (unsigned)(b->sight_n - i));
+            memcpy(f.s, b->sight + i, f.n * sizeof(HoneSighting));
+            emit(b->s, HoneMsgSighting, &f, (uint8_t)(offsetof(HoneBodySighting, s) + f.n * sizeof(HoneSighting)));
+        }
+        if(b->sight_n) FURI_LOG_I(TAG, "sightings w%lu: %u", b->window, b->sight_n);
+    }
+    if(day != b->day) {
+        b->day = day;
+        b->day_n = 0; /* new K_day: yesterday's oids mean nothing now */
+    } else {
+        for(uint16_t i = 0; i < b->win_n && b->day_n < HONE_BLE_DAY_SET; i++) {
+            uint32_t fp = (uint32_t)b->win_set[i];
+            if(!fp_has(b->day_fp, b->day_n, fp)) b->day_fp[b->day_n++] = fp;
+        }
+    }
+    b->win_n = 0;
+    b->win_returning = 0;
+    b->scans = 0;
+    b->sight_n = 0;
+    memset(&b->crowd, 0, sizeof(b->crowd));
+}
+
+static int32_t ble_lane(void* ctx) {
+    HoneSrv* s = ctx;
+    furi_record_open(RECORD_BT); /* blocks until the BT service is up */
+    furi_record_close(RECORD_BT);
+
+    HoneBle* b = malloc(sizeof(HoneBle));
+    memset(b, 0, sizeof(*b));
+    b->s = s;
+    b->q = furi_message_queue_alloc(48, sizeof(GapObserverReport));
+    b->scan_set = malloc(HONE_BLE_SCAN_SET * sizeof(uint64_t));
+    b->win_set = malloc(HONE_BLE_WIN_SET * sizeof(uint64_t));
+    b->day_fp = malloc(HONE_BLE_DAY_SET * sizeof(uint32_t));
+    uint8_t k_day[32];
+    uint32_t last_scan = 0;
+    bool warned = false;
+
+    while(1) {
+        if(s->paused) {
+            furi_delay_ms(1000);
+            continue;
+        }
+        uint32_t day;
+        k_day_get(s, k_day, &day);
+        uint32_t window = utc_now(s) / HONE_WINDOW_S;
+        if(window != b->window) {
+            ble_close_window(b, day);
+            b->window = window;
+        }
+        if(last_scan && furi_get_tick() - last_scan < furi_ms_to_ticks(HONE_BLE_EVERY_MS)) {
+            furi_delay_ms(500);
+            continue;
+        }
+        last_scan = furi_get_tick();
+
+        s->observer_ok = gap_observer_supported();
+        if(!s->observer_ok) {
+            if(!warned) FURI_LOG_W(TAG, "ble: radio stack cannot scan (light stack?)");
+            warned = true;
+            b->crowd.flags |= HONE_CROWD_NO_OBSERVER;
+            continue;
+        }
+        warned = false;
+        memset(&b->crowd, 0, sizeof(b->crowd));
+        b->scan_n = 0;
+        b->dropped = 0;
+        furi_message_queue_reset(b->q);
+        if(!gap_observer_start(HONE_BLE_INTERVAL_MS, HONE_BLE_WINDOW_MS, ble_report_cb, b)) {
+            FURI_LOG_W(TAG, "ble: scan start refused");
+            continue;
+        }
+        uint32_t t0 = furi_get_tick();
+        GapObserverReport r;
+        while(furi_get_tick() - t0 < furi_ms_to_ticks(HONE_BLE_SCAN_MS)) {
+            if(furi_message_queue_get(b->q, &r, furi_ms_to_ticks(100)) == FuriStatusOk)
+                ble_take(b, &r, k_day);
+        }
+        gap_observer_stop();
+        uint32_t scan_ms = (furi_get_tick() - t0) * 1000 / furi_kernel_get_tick_frequency();
+        while(furi_message_queue_get(b->q, &r, 0) == FuriStatusOk) ble_take(b, &r, k_day);
+        b->crowd.scan_ms = (uint16_t)MIN(scan_ms, 0xFFFFu);
+        if(b->scans < 255) b->scans++;
+        if(b->dropped) FURI_LOG_D(TAG, "ble: %lu reports dropped", b->dropped);
+        ble_emit_crowd(b, 0);
     }
     return 0;
 }
@@ -783,6 +1274,8 @@ static size_t build_announce(HoneSrv* s, uint8_t* out) {
     memcpy(b.owner, s->owner, sizeof(b.owner));
     if(s->wifi_ok_tick && furi_get_tick() - s->wifi_ok_tick < furi_ms_to_ticks(5 * 60000))
         b.caps |= HONE_CAP_WIFI;
+    if(s->observer_ok) b.caps |= HONE_CAP_BLE_OBS;
+    if(s->seed_ok) b.caps |= HONE_CAP_RID;
     if(s->ext_power) b.flags |= HONE_FLAG_EXT_POWER;
     if(s->paused) b.flags |= HONE_FLAG_PAUSED;
 
@@ -815,6 +1308,40 @@ static void send_fragments(
         if(!*started) *started = furi_hal_bt_extra_beacon_start();
         furi_delay_ms(HONE_FRAG_MS);
     }
+}
+
+/* ─── rotating rid advert (spec 1a) ───────────────────────────────────────
+ * The beacon is time-shared: HA/HC fragments on the fixed HONE address, then
+ * the rid advert on its own per-window random static address. Both rid and
+ * address are derived from (seed, window) at the start of every slot and the
+ * slot is cut at the quarter-hour, so they change together at the boundary.
+ * Format (same as the Android advert, SIGHTINGS.md v1):
+ *   [0x17][0xFF][0xFF 0xFF]['h']['R'][0x01][win8][rid 16] */
+#define HONE_RID_SLOT_MS 1500u
+
+static void rid_slot(HoneSrv* s, const GapExtraBeaconConfig* home, bool* started) {
+    uint32_t utc = utc_now(s);
+    uint32_t window = utc / HONE_WINDOW_S;
+    uint8_t rid[16];
+    GapExtraBeaconConfig cfg = *home;
+    if(!rid_for(s, window, rid, cfg.address)) return;
+    cfg.address_type = GapAddressTypeRandom;
+
+    uint8_t adv[24] = {0x17, 0xFF, 0xFF, 0xFF, 'h', 'R', 0x01, (uint8_t)(window & 0xFF)};
+    memcpy(adv + 8, rid, 16);
+    memset(rid, 0, sizeof(rid));
+
+    uint32_t to_boundary_ms = (HONE_WINDOW_S - utc % HONE_WINDOW_S) * 1000u;
+    uint32_t hold = MIN(HONE_RID_SLOT_MS, to_boundary_ms);
+    if(*started) furi_hal_bt_extra_beacon_stop();
+    *started = false;
+    if(furi_hal_bt_extra_beacon_set_config(&cfg) && furi_hal_bt_extra_beacon_set_data(adv, sizeof(adv)) &&
+       furi_hal_bt_extra_beacon_start()) {
+        furi_delay_ms(hold);
+        furi_hal_bt_extra_beacon_stop();
+    }
+    /* back to the HONE address; send_fragments restarts the beacon */
+    furi_hal_bt_extra_beacon_set_config(home);
 }
 
 static int32_t announce_lane(void* ctx) {
@@ -871,6 +1398,7 @@ static int32_t announce_lane(void* ctx) {
             send_fragments(adv, 'C', c->seq, c->data, HONE_COMMIT_LEN, &started);
             break;
         }
+        if(s->seed_ok) rid_slot(s, &cfg, &started);
     }
     return 0;
 }
@@ -898,6 +1426,11 @@ int32_t hone_srv(void* p) {
     counter_load(s);
     read_file(s->storage, HONE_ANCHOR_PATH, s->anchor, HONE_ANCHOR_LEN);
     owner_load(s);
+    s->seed_lock = furi_mutex_alloc(FuriMutexTypeNormal);
+    s->kday_lock = furi_mutex_alloc(FuriMutexTypeNormal);
+    s->utc_offset_min = HONE_UTC_OFFSET_DEFAULT;
+    tz_load(s);
+    seed_load(s);
     hone_sched_init(&s->sched);
     hone_sched_set_enabled(&s->sched, HoneSensorSubGhz, false); /* own lane */
     hone_sched_set_enabled(&s->sched, HoneSensorWifi, false);   /* own lane */
@@ -913,12 +1446,15 @@ int32_t hone_srv(void* p) {
     lane_start("HoneSubGhz", subghz_lane, s);
     lane_start("HoneWifi", wifi_lane, s);
     lane_start("HoneAnnounce", announce_lane, s);
+    lane_start("HoneBle", ble_lane, s);
 
     uint32_t last_maint_check = furi_get_tick();
     while(1) {
         if(furi_get_tick() - last_maint_check > furi_ms_to_ticks(5000)) {
             s->paused = storage_file_exists(s->storage, HONE_MAINT_PATH);
             owner_load(s); /* picks up a claim without a reboot */
+            seed_load(s);  /* and a provisioned (or removed) id seed */
+            tz_load(s);
             last_maint_check = furi_get_tick();
         }
         if(s->paused) {
