@@ -40,7 +40,8 @@
  * Maximum number of simultaneous connections that the device will support.
  * Valid values are from 1 to 8
  */
-#define CFG_BLE_NUM_LINK 2
+/* HONE: 3 = connection or connectable advert, extra beacon, observer scan */
+#define CFG_BLE_NUM_LINK 3
 
 /**
  * Maximum number of Services that can be stored in the GATT database.

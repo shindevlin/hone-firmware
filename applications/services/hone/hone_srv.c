@@ -152,6 +152,8 @@ typedef struct {
     uint8_t k_day[32];
     uint32_t k_day_day; /* floor(utc / 86400) it belongs to; 0 = unset */
     volatile bool observer_ok;
+    volatile bool beacon_hold; /* BLE lane asks the announce lane to free the radio slot */
+    volatile bool beacon_held;
 } HoneSrv;
 
 _Static_assert(sizeof(HoneBodyBleCrowd) == 29, "crowd body");
@@ -1234,9 +1236,19 @@ static int32_t ble_lane(void* ctx) {
         b->scan_n = 0;
         b->dropped = 0;
         furi_message_queue_reset(b->q);
+        bool held = false;
         if(!gap_observer_start(HONE_BLE_INTERVAL_MS, HONE_BLE_WINDOW_MS, ble_report_cb, b)) {
-            FURI_LOG_W(TAG, "ble: scan start refused");
-            continue;
+            /* No free radio slot (e.g. a phone connected): borrow the extra
+             * beacon's slot for this scan. */
+            s->beacon_hold = true;
+            for(int i = 0; i < 60 && !s->beacon_held; i++) furi_delay_ms(100);
+            held = true;
+            if(!s->beacon_held ||
+               !gap_observer_start(HONE_BLE_INTERVAL_MS, HONE_BLE_WINDOW_MS, ble_report_cb, b)) {
+                s->beacon_hold = false;
+                FURI_LOG_W(TAG, "ble: scan start refused");
+                continue;
+            }
         }
         uint32_t t0 = furi_get_tick();
         GapObserverReport r;
@@ -1245,6 +1257,7 @@ static int32_t ble_lane(void* ctx) {
                 ble_take(b, &r, k_day);
         }
         gap_observer_stop();
+        if(held) s->beacon_hold = false;
         uint32_t scan_ms = (furi_get_tick() - t0) * 1000 / furi_kernel_get_tick_frequency();
         while(furi_message_queue_get(b->q, &r, 0) == FuriStatusOk) ble_take(b, &r, k_day);
         b->crowd.scan_ms = (uint16_t)MIN(scan_ms, 0xFFFFu);
@@ -1372,6 +1385,14 @@ static int32_t announce_lane(void* ctx) {
     uint8_t rr = 0;
     bool started = false;
     while(1) {
+        if(s->beacon_hold) {
+            if(started) furi_hal_bt_extra_beacon_stop();
+            started = false;
+            s->beacon_held = true;
+            while(s->beacon_hold) furi_delay_ms(100);
+            s->beacon_held = false;
+            continue;
+        }
         if(s->paused) {
             if(started) furi_hal_bt_extra_beacon_stop();
             started = false;
