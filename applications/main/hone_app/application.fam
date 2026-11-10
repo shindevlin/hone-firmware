@@ -1,0 +1,10 @@
+App(
+    appid="hone_app",
+    name="Hone",
+    apptype=FlipperAppType.APP,
+    entry_point="hone_app",
+    requires=["hone", "gui"],
+    icon="A_Hone_14",
+    stack_size=2 * 1024,
+    order=1,
+)

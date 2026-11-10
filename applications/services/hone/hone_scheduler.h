@@ -84,6 +84,7 @@ void hone_sched_set_battery(HoneScheduler* s, uint8_t pct);
  * that is backed off unless every sensor is backed off (then it returns the
  * one closest to ready, so the loop always makes progress).
  */
+/* Returns HoneSensorCount when every sensor is backed off or capped: idle. */
 HoneSensorKind hone_sched_next(HoneScheduler* s);
 
 /*

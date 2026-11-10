@@ -111,22 +111,10 @@ HoneSensorKind hone_sched_next(HoneScheduler* s) {
         if(eligible(s, k)) return k;
     }
 
-    /* Everything is backed off or capped. Return the non-heartbeat sensor
-     * with the fewest skip cycles remaining so the loop still makes progress
-     * (prefer one that isn't hard-capped this epoch). */
-    HoneSensorKind best = HoneSensorHeartbeat; /* if nothing else is enabled */
-    uint32_t best_skip = 0xFFFFFFFFu;
-    for(size_t i = 0; i < HoneSensorCount; i++) {
-        HoneSensorKind k = (HoneSensorKind)i;
-        if(k == HoneSensorHeartbeat) continue;
-        if(s->sensors[i].disabled) continue;
-        if(hone_sched_at_cap(s, k)) continue;
-        if(s->sensors[i].skip_remaining < best_skip) {
-            best_skip = s->sensors[i].skip_remaining;
-            best = k;
-        }
-    }
-    return best;
+    /* Everything is backed off or capped: idle this cycle. Forcing the
+     * least-backed-off sensor here made the backoff a no-op, so with no card
+     * in the field NFC ran almost back to back (endless FWT timeouts). */
+    return HoneSensorCount;
 }
 
 void hone_sched_report(HoneScheduler* s, HoneSensorKind kind, bool found) {

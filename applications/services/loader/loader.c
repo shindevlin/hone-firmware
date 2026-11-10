@@ -373,6 +373,8 @@ static const FlipperInternalApplication* loader_find_application_by_name(const c
         const FlipperInternalApplication* list;
         const uint32_t count;
     } lists[] = {
+        /* main-menu apps built into the firmware (the Hone screen) */
+        {FLIPPER_APPS, FLIPPER_APPS_COUNT},
         {FLIPPER_SETTINGS_APPS, FLIPPER_SETTINGS_APPS_COUNT},
         {FLIPPER_SYSTEM_APPS, FLIPPER_SYSTEM_APPS_COUNT},
         {FLIPPER_DEBUG_APPS, FLIPPER_DEBUG_APPS_COUNT},

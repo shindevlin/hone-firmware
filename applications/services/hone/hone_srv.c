@@ -58,10 +58,14 @@
 #include <furi_hal_crypto.h>
 #include <datetime/datetime.h>
 #include "crypto/tweetnacl.h"
+#include "hone_status.h"
+#include <loader/loader.h>
+#include <gui/gui.h>
+#include <stm32wbxx_ll_rcc.h>
 #include <stdlib.h>
 
 #define TAG "HoneSrv"
-#define HONE_FW_VERSION "2.1.0"
+#define HONE_FW_VERSION "2.1.1"
 
 #define HONE_DIR         EXT_PATH("apps_data/hone")
 #define HONE_KEY_PATH    HONE_DIR "/identity.key"
@@ -88,6 +92,8 @@
 /* The Flipper RTC keeps LOCAL time. Offset of local time from UTC, in minutes,
  * as text (e.g. "-360"). Missing file = HONE_UTC_OFFSET_DEFAULT. */
 #define HONE_TZ_PATH     HONE_DIR "/utc_offset_min"
+#define HONE_BOOT_LOG    HONE_DIR "/boot.log"  /* one line per boot: time, reset cause, downtime */
+#define HONE_ALIVE_PATH  HONE_DIR "/alive.bin" /* u32 RTC, refreshed every minute */
 #define HONE_UTC_OFFSET_DEFAULT (-360) /* America/El_Salvador, UTC-6, no DST */
 
 /* ─── batch commits ───────────────────────────────────────────────────────
@@ -132,6 +138,21 @@ typedef struct {
  * Receive only, so region does not apply (region limits TX, checked at TX). */
 static const uint32_t hone_subghz_freqs[] = {433920000UL, 315000000UL, 915000000UL, 868350000UL};
 
+typedef enum {
+    HoneLaneTag,
+    HoneLaneSubGhz,
+    HoneLaneWifi,
+    HoneLaneBle,
+    HoneLaneAnnounce,
+    HoneLaneCount,
+} HoneLane;
+
+struct HoneStatusRecord {
+    FuriMutex* lock;
+    HoneStatus st;
+    volatile bool ui_open;
+};
+
 typedef struct {
     Storage* storage;
     uint8_t pk[32];
@@ -165,6 +186,14 @@ typedef struct {
     volatile bool observer_ok;
     volatile bool beacon_hold; /* BLE lane asks the announce lane to free the radio slot */
     volatile bool beacon_held;
+    /* Another app is starting or running: every lane releases its hardware
+     * (radios, timers, USART, 5 V, BLE stack calls) until the loader says it
+     * stopped. Set from the loader's pubsub, which waits for busy[] to clear. */
+    volatile bool app_hold;
+    volatile uint32_t hold_tick;
+    volatile bool busy[HoneLaneCount];
+    FuriMutex* otg_lock; /* Wi-Fi board power vs the iButton reader's 5 V request */
+    HoneStatusRecord rec;
 } HoneSrv;
 
 _Static_assert(sizeof(HoneBodyBleCrowd) == 29, "crowd body");
@@ -475,6 +504,151 @@ static uint32_t counter_next(HoneSrv* s) {
     return s->counter++;
 }
 
+/* ─── sharing the hardware with other apps ────────────────────────────────
+ * HoneSrv runs under every app. Before the loader starts one (the Hone screen
+ * excepted) every lane parks: it finishes or cuts its slot short, powers its
+ * sensor down and stops calling into the BLE stack, so the app (or a BT
+ * profile change, Bluetooth settings, SD unmount...) never meets a half-held
+ * radio. A lane marks itself busy BEFORE it checks the hold, so the loader
+ * callback cannot miss a lane that is just starting a slot. */
+
+static bool hone_should_yield(const HoneSrv* s) {
+    return s->paused || (s->app_hold && !s->rec.ui_open);
+}
+
+/* true = go ahead, lane is now busy; false = parked, try again later */
+static bool lane_enter(HoneSrv* s, HoneLane lane) {
+    s->busy[lane] = true;
+    if(hone_should_yield(s)) {
+        s->busy[lane] = false;
+        return false;
+    }
+    return true;
+}
+
+static void lane_leave(HoneSrv* s, HoneLane lane) {
+    s->busy[lane] = false;
+}
+
+#define ST_LOCK(s)   furi_check(furi_mutex_acquire((s)->rec.lock, FuriWaitForever) == FuriStatusOk)
+#define ST_UNLOCK(s) furi_mutex_release((s)->rec.lock)
+
+void hone_status_get(HoneStatusRecord* rec, HoneStatus* out) {
+    furi_check(rec && out);
+    furi_check(furi_mutex_acquire(rec->lock, FuriWaitForever) == FuriStatusOk);
+    *out = rec->st;
+    furi_mutex_release(rec->lock);
+}
+
+void hone_status_ui_open(HoneStatusRecord* rec, bool open) {
+    furi_check(rec);
+    rec->ui_open = open;
+}
+
+static void status_tag_lane(HoneSrv* s, const char* name) {
+    ST_LOCK(s);
+    strlcpy(s->rec.st.tag_lane, name, sizeof(s->rec.st.tag_lane));
+    ST_UNLOCK(s);
+}
+
+static void loader_event_cb(const void* message, void* context) {
+    const LoaderEvent* e = message;
+    HoneSrv* s = context;
+    if(e->type == LoaderEventTypeApplicationBeforeLoad) {
+        s->hold_tick = furi_get_tick();
+        s->app_hold = true;
+        /* Wait for the lanes to let go (a slot is at most ~2 s; long Wi-Fi and
+         * BLE windows check the hold and cut short). */
+        for(int i = 0; i < 40; i++) {
+            bool any = false;
+            for(int l = 0; l < HoneLaneCount; l++) any |= s->busy[l];
+            if(!any) break;
+            furi_delay_ms(100);
+        }
+    } else if(
+        e->type == LoaderEventTypeApplicationStopped ||
+        e->type == LoaderEventTypeApplicationLoadFailed) {
+        s->rec.ui_open = false;
+        s->app_hold = false;
+    }
+}
+
+/* ─── boot record: why did we restart? ───────────────────────────────────
+ * Reads the reset flags and the crash message the previous run left in the
+ * RTC, appends one line to boot.log, and keeps it for the Hone screen. The
+ * reset flags are cleared afterwards so the next boot reads only its own. */
+static void boot_record(HoneSrv* s) {
+    char reason[40];
+    const char* fault = (const char*)furi_hal_rtc_get_fault_data();
+    uint32_t csr = RCC->CSR;
+    if(fault) {
+        /* furi_crash stores a pointer to a message in flash */
+        snprintf(reason, sizeof(reason), "crash: %s", fault);
+    } else if(csr & (RCC_CSR_IWDGRSTF | RCC_CSR_WWDGRSTF)) {
+        strlcpy(reason, "watchdog reset", sizeof(reason));
+    } else if(csr & RCC_CSR_LPWRRSTF) {
+        strlcpy(reason, "low-power reset", sizeof(reason));
+    } else if(csr & RCC_CSR_SFTRSTF) {
+        strlcpy(reason, "software reboot (no crash)", sizeof(reason));
+    } else if(csr & RCC_CSR_BORRSTF) {
+        strlcpy(reason, "power on / brownout", sizeof(reason));
+    } else if(csr & RCC_CSR_PINRSTF) {
+        strlcpy(reason, "reset button", sizeof(reason));
+    } else {
+        strlcpy(reason, "unknown", sizeof(reason));
+    }
+    for(char* p = reason; *p; p++)
+        if(*p == '\n' || *p == '\r') *p = ' ';
+    LL_RCC_ClearResetFlags();
+
+    uint32_t now = furi_hal_rtc_get_timestamp();
+    uint32_t alive = 0, down = 0;
+    if(read_file(s->storage, HONE_ALIVE_PATH, &alive, sizeof(alive)) && alive && now >= alive)
+        down = now - alive;
+
+    char line[112];
+    DateTime dt;
+    datetime_timestamp_to_datetime(now, &dt);
+    int n = snprintf(
+        line, sizeof(line), "%04u-%02u-%02u %02u:%02u:%02u csr=%08lx down=%lus %s\n", dt.year,
+        dt.month, dt.day, dt.hour, dt.minute, dt.second, (unsigned long)csr, (unsigned long)down,
+        reason);
+    File* f = storage_file_alloc(s->storage);
+    if(n > 0 && storage_file_open(f, HONE_BOOT_LOG, FSAM_WRITE, FSOM_OPEN_APPEND))
+        storage_file_write(f, line, (size_t)MIN(n, (int)sizeof(line) - 1));
+    storage_file_close(f);
+    storage_file_free(f);
+    FURI_LOG_W(TAG, "boot: %s", line);
+
+    ST_LOCK(s);
+    strlcpy(s->rec.st.boot_reason, reason, sizeof(s->rec.st.boot_reason));
+    s->rec.st.boot_rtc = now;
+    s->rec.st.down_s = down;
+    ST_UNLOCK(s);
+}
+
+static void alive_touch(HoneSrv* s) {
+    uint32_t now = furi_hal_rtc_get_timestamp();
+    write_file(s->storage, HONE_ALIVE_PATH, &now, sizeof(now));
+}
+
+/* ─── desktop status-bar icon: a small "H" while HONE runs ──────────────── */
+
+static void statusbar_draw(Canvas* canvas, void* ctx) {
+    HoneSrv* s = ctx;
+    /* 7x8 box with an H; hollow while paused or yielding */
+    if(hone_should_yield(s)) {
+        canvas_draw_frame(canvas, 0, 0, 7, 8);
+    } else {
+        canvas_draw_box(canvas, 0, 0, 7, 8);
+        canvas_set_color(canvas, ColorWhite);
+    }
+    canvas_draw_line(canvas, 2, 2, 2, 5);
+    canvas_draw_line(canvas, 4, 2, 4, 5);
+    canvas_draw_dot(canvas, 3, 4);
+    canvas_set_color(canvas, ColorBlack);
+}
+
 static void queue_append(HoneSrv* s, const uint8_t* frame, size_t len) {
     FileInfo fi;
     if(storage_common_stat(s->storage, HONE_QUEUE_PATH, &fi) == FSE_OK &&
@@ -498,7 +672,7 @@ static void queue_append(HoneSrv* s, const uint8_t* frame, size_t len) {
 
 /* ─── sensors: each one acquires and fully releases its hardware ───────── */
 
-static bool capture_subghz(HoneBodySubGhz* out) {
+static bool capture_subghz(const HoneSrv* s, HoneBodySubGhz* out) {
     static size_t next = 0;
     uint32_t freq = hone_subghz_freqs[next++ % COUNT_OF(hone_subghz_freqs)];
     if(!furi_hal_subghz_is_frequency_valid(freq)) return false;
@@ -513,7 +687,7 @@ static bool capture_subghz(HoneBodySubGhz* out) {
     float peak = -200.0f, sum = 0.0f;
     uint16_t n = 0;
     uint32_t start = furi_get_tick();
-    while(furi_get_tick() - start < furi_ms_to_ticks(HONE_SLOT_MS)) {
+    while(furi_get_tick() - start < furi_ms_to_ticks(HONE_SLOT_MS) && !hone_should_yield(s)) {
         float r = furi_hal_subghz_get_rssi();
         if(r > peak) peak = r;
         sum += r;
@@ -524,7 +698,7 @@ static bool capture_subghz(HoneBodySubGhz* out) {
     furi_hal_subghz_idle();
     furi_hal_subghz_sleep(); /* fully released before any signing */
 
-    if(!n) return false;
+    if(!n || hone_should_yield(s)) return false; /* cut short: not a full window */
     out->freq_hz = freq;
     out->rssi_peak_dbm = (int8_t)CLAMP(peak, 0.0f, -128.0f);
     out->rssi_avg_dbm = (int8_t)CLAMP(sum / n, 0.0f, -128.0f);
@@ -650,6 +824,9 @@ static void ibutton_cb(void* ctx) {
 }
 
 static bool capture_ibutton(HoneSrv* s, HoneBodyTag* out) {
+    /* The iButton reader asks the power service for 5 V. That same 5 V feeds
+     * the Wi-Fi board: never switch it under a running Wi-Fi scan. */
+    if(furi_mutex_acquire(s->otg_lock, 0) != FuriStatusOk) return false;
     HoneWait w = {.done = furi_semaphore_alloc(1, 0)};
     iButtonProtocols* protocols = ibutton_protocols_alloc();
     iButtonKey* key = ibutton_key_alloc(ibutton_protocols_get_max_data_size(protocols));
@@ -673,6 +850,7 @@ static bool capture_ibutton(HoneSrv* s, HoneBodyTag* out) {
     ibutton_key_free(key);
     ibutton_protocols_free(protocols);
     furi_semaphore_free(w.done);
+    furi_mutex_release(s->otg_lock);
     return got;
 }
 
@@ -848,11 +1026,13 @@ static bool wifi_parse(const char* line, HoneBodyWifi* out) {
 /* One dev board session. hone-esp >= 0.2 gets the day's oid subkey and a SCAN2
  * (body v2, *v2 = true); an older board falls back to the v1 SCAN. */
 static bool capture_wifi(HoneSrv* s, HoneBodyWifi* v1, HoneBodyWifi2* v2, bool* is_v2) {
+    furi_check(furi_mutex_acquire(s->otg_lock, FuriWaitForever) == FuriStatusOk);
     bool otg_was_on = furi_hal_power_is_otg_enabled();
     if(!otg_was_on) furi_hal_power_enable_otg();
     FuriHalSerialHandle* h = furi_hal_serial_control_acquire(FuriHalSerialIdUsart);
     if(!h) {
         if(!otg_was_on) furi_hal_power_disable_otg();
+        furi_mutex_release(s->otg_lock);
         return false;
     }
     FuriStreamBuffer* sb = furi_stream_buffer_alloc(1024, 1);
@@ -863,7 +1043,8 @@ static bool capture_wifi(HoneSrv* s, HoneBodyWifi* v1, HoneBodyWifi2* v2, bool* 
     bool alive = false, got = false, new_board = false;
     *is_v2 = false;
     uint32_t start = furi_get_tick();
-    while(!alive && furi_get_tick() - start < furi_ms_to_ticks(HONE_WIFI_BOOT_MS)) {
+    while(!alive && furi_get_tick() - start < furi_ms_to_ticks(HONE_WIFI_BOOT_MS) &&
+          !hone_should_yield(s)) {
         furi_hal_serial_tx(h, (const uint8_t*)"PING\n", 5);
         while(wifi_readline(sb, line, 400, 500)) {
             if(strncmp(line, "PONG", 4) == 0) {
@@ -898,7 +1079,8 @@ static bool capture_wifi(HoneSrv* s, HoneBodyWifi* v1, HoneBodyWifi2* v2, bool* 
             int n = snprintf(sc, sizeof(sc), "SCAN2 %u\n", (unsigned)HONE_WIFI_LISTEN_MS);
             furi_hal_serial_tx(h, (const uint8_t*)sc, n);
             start = furi_get_tick();
-            while(!got && furi_get_tick() - start < furi_ms_to_ticks(HONE_WIFI2_SCAN_MS)) {
+            while(!got && furi_get_tick() - start < furi_ms_to_ticks(HONE_WIFI2_SCAN_MS) &&
+          !hone_should_yield(s)) {
                 if(wifi_readline(sb, line, 400, 500)) got = wifi2_parse(line, v2);
             }
             *is_v2 = got;
@@ -907,7 +1089,8 @@ static bool capture_wifi(HoneSrv* s, HoneBodyWifi* v1, HoneBodyWifi2* v2, bool* 
     if(alive && !new_board) {
         furi_hal_serial_tx(h, (const uint8_t*)"SCAN\n", 5);
         start = furi_get_tick();
-        while(!got && furi_get_tick() - start < furi_ms_to_ticks(HONE_WIFI_SCAN_MS)) {
+        while(!got && furi_get_tick() - start < furi_ms_to_ticks(HONE_WIFI_SCAN_MS) &&
+          !hone_should_yield(s)) {
             if(wifi_readline(sb, line, 400, 500)) got = wifi_parse(line, v1);
         }
     }
@@ -918,6 +1101,7 @@ static bool capture_wifi(HoneSrv* s, HoneBodyWifi* v1, HoneBodyWifi2* v2, bool* 
     furi_hal_serial_control_release(h);
     furi_stream_buffer_free(sb);
     if(!otg_was_on) furi_hal_power_disable_otg(); /* board fully off between slots */
+    furi_mutex_release(s->otg_lock);
     return got;
 }
 
@@ -943,6 +1127,10 @@ static void emit(HoneSrv* s, HoneMsgType type, const void* body, uint8_t body_le
     if(len) {
         queue_append(s, s->frame, len);
         s->total_frames++;
+        ST_LOCK(s);
+        s->rec.st.frames = s->total_frames;
+        s->rec.st.counter = s->counter;
+        ST_UNLOCK(s);
         int g = group_of(type);
         if(g >= 0) {
             HoneBatch* b = &s->batch[g];
@@ -1013,8 +1201,23 @@ static void batches_flush(HoneSrv* s) {
             storage_file_write(f, &now, sizeof(now));
         storage_file_close(f);
         storage_file_free(f);
+        ST_LOCK(s);
+        s->rec.st.commits++;
+        ST_UNLOCK(s);
         FURI_LOG_I(TAG, "commit %s x%u", hone_group_name[g], (unsigned)count);
     }
+}
+
+static void ir_status(HoneSrv* s, const HoneBodyIr* b) {
+    ST_LOCK(s);
+    if(b->protocol < 0)
+        snprintf(s->rec.st.last_tag, sizeof(s->rec.st.last_tag), "IR raw %u", b->raw_timings);
+    else
+        snprintf(
+            s->rec.st.last_tag, sizeof(s->rec.st.last_tag), "IR p%d %lx/%lx", b->protocol,
+            (unsigned long)b->address, (unsigned long)b->command);
+    s->rec.st.last_tag_tick = furi_get_tick();
+    ST_UNLOCK(s);
 }
 
 /* Run one slot. Returns true if the sensor produced a reading. */
@@ -1036,6 +1239,11 @@ static bool run_slot(HoneSrv* s, HoneSensorKind k) {
                                   adc, furi_hal_adc_read(adc, FuriHalAdcChannelTEMPSENSOR)) * 10);
         furi_hal_adc_release(adc);
         emit(s, HoneMsgHeartbeat, &b, sizeof(b));
+        alive_touch(s); /* next boot can tell an instant reset from a power loss */
+        ST_LOCK(s);
+        s->rec.st.battery_pct = b.battery_pct;
+        s->rec.st.ext_power = s->ext_power;
+        ST_UNLOCK(s);
         FURI_LOG_I(TAG, "heartbeat batt %u frames %lu", b.battery_pct, b.total_frames);
         return true;
     }
@@ -1054,12 +1262,19 @@ static bool run_slot(HoneSrv* s, HoneSensorKind k) {
             HoneBodyIr irb;
             if(ir_end(&ir, &irb)) {
                 emit(s, HoneMsgIr, &irb, sizeof(irb));
+                ir_status(s, &irb);
                 FURI_LOG_I(TAG, "ir proto %d addr %lx cmd %lx", irb.protocol, irb.address, irb.command);
             }
         }
         if(!got) return false;
         HoneMsgType t = k == HoneSensorNfc ? HoneMsgNfc : k == HoneSensorRfid ? HoneMsgRfid : HoneMsgIButton;
         emit(s, t, &b, sizeof(b));
+        ST_LOCK(s);
+        snprintf(
+            s->rec.st.last_tag, sizeof(s->rec.st.last_tag), "%s proto %u",
+            t == HoneMsgNfc ? "NFC" : t == HoneMsgRfid ? "RFID" : "iButton", b.protocol);
+        s->rec.st.last_tag_tick = furi_get_tick();
+        ST_UNLOCK(s);
         FURI_LOG_I(TAG, "tag type %d proto %u idlen %u", t, b.protocol, b.id_len);
         return true;
     }
@@ -1067,6 +1282,7 @@ static bool run_slot(HoneSrv* s, HoneSensorKind k) {
         HoneBodyIr b;
         if(!capture_ir(&b)) return false;
         emit(s, HoneMsgIr, &b, sizeof(b));
+        ir_status(s, &b);
         FURI_LOG_I(TAG, "ir proto %d addr %lx cmd %lx", b.protocol, b.address, b.command);
         return true;
     }
@@ -1083,13 +1299,21 @@ static bool run_slot(HoneSrv* s, HoneSensorKind k) {
 static int32_t subghz_lane(void* ctx) {
     HoneSrv* s = ctx;
     while(1) {
-        if(s->paused) {
+        if(!lane_enter(s, HoneLaneSubGhz)) {
             furi_delay_ms(1000);
             continue;
         }
         HoneBodySubGhz b;
-        if(capture_subghz(&b)) {
+        bool got = capture_subghz(s, &b);
+        lane_leave(s, HoneLaneSubGhz); /* radio is asleep again */
+        if(got) {
             emit(s, HoneMsgSubGhz, &b, sizeof(b));
+            ST_LOCK(s);
+            s->rec.st.subghz_freq = b.freq_hz;
+            s->rec.st.subghz_peak = b.rssi_peak_dbm;
+            s->rec.st.subghz_avg = b.rssi_avg_dbm;
+            s->rec.st.subghz_tick = furi_get_tick();
+            ST_UNLOCK(s);
             FURI_LOG_D(TAG, "subghz %lu peak %d avg %d", b.freq_hz, b.rssi_peak_dbm, b.rssi_avg_dbm);
         } else {
             furi_delay_ms(1000);
@@ -1102,7 +1326,7 @@ static int32_t wifi_lane(void* ctx) {
     HoneSrv* s = ctx;
     uint32_t last = 0;
     while(1) {
-        if(s->paused) {
+        if(hone_should_yield(s)) {
             furi_delay_ms(1000);
             continue;
         }
@@ -1114,12 +1338,20 @@ static int32_t wifi_lane(void* ctx) {
             furi_delay_ms(1000);
             continue;
         }
+        if(!lane_enter(s, HoneLaneWifi)) continue;
         last = furi_get_tick();
         HoneBodyWifi b;
         HoneBodyWifi2 b2;
         bool v2;
-        if(capture_wifi(s, &b, &b2, &v2)) {
+        bool got = capture_wifi(s, &b, &b2, &v2);
+        lane_leave(s, HoneLaneWifi); /* USART released, 5 V back as it was */
+        if(got) {
             s->wifi_ok_tick = furi_get_tick();
+            ST_LOCK(s);
+            s->rec.st.wifi_aps = v2 ? b2.aps : b.aps;
+            s->rec.st.wifi_probes = v2 ? b2.probes : b.probes;
+            s->rec.st.wifi_tick = s->wifi_ok_tick;
+            ST_UNLOCK(s);
             if(v2) {
                 emit(s, HoneMsgWifi2, &b2, (uint8_t)(offsetof(HoneBodyWifi2, top) + b2.n_top * sizeof(HoneWifiAp)));
                 FURI_LOG_I(
@@ -1375,7 +1607,7 @@ static int32_t ble_lane(void* ctx) {
     bool warned = false;
 
     while(1) {
-        if(s->paused) {
+        if(hone_should_yield(s)) {
             furi_delay_ms(1000);
             continue;
         }
@@ -1390,10 +1622,12 @@ static int32_t ble_lane(void* ctx) {
             furi_delay_ms(500);
             continue;
         }
+        if(!lane_enter(s, HoneLaneBle)) continue;
         last_scan = furi_get_tick();
 
         s->observer_ok = gap_observer_supported();
         if(!s->observer_ok) {
+            lane_leave(s, HoneLaneBle);
             if(!warned) FURI_LOG_W(TAG, "ble: radio stack cannot scan (light stack?)");
             warned = true;
             b->crowd.flags |= HONE_CROWD_NO_OBSERVER;
@@ -1414,24 +1648,32 @@ static int32_t ble_lane(void* ctx) {
             if(!s->beacon_held ||
                !gap_observer_start(HONE_BLE_INTERVAL_MS, HONE_BLE_WINDOW_MS, ble_report_cb, b)) {
                 s->beacon_hold = false;
+                lane_leave(s, HoneLaneBle);
                 FURI_LOG_W(TAG, "ble: scan start refused");
                 continue;
             }
         }
         uint32_t t0 = furi_get_tick();
         GapObserverReport r;
-        while(furi_get_tick() - t0 < furi_ms_to_ticks(HONE_BLE_SCAN_MS)) {
+        while(furi_get_tick() - t0 < furi_ms_to_ticks(HONE_BLE_SCAN_MS) && !hone_should_yield(s)) {
             if(furi_message_queue_get(b->q, &r, furi_ms_to_ticks(100)) == FuriStatusOk)
                 ble_take(b, &r, k_day);
         }
         gap_observer_stop();
         if(held) s->beacon_hold = false;
+        lane_leave(s, HoneLaneBle); /* no more stack calls from this lane */
         uint32_t scan_ms = (furi_get_tick() - t0) * 1000 / furi_kernel_get_tick_frequency();
         while(furi_message_queue_get(b->q, &r, 0) == FuriStatusOk) ble_take(b, &r, k_day);
         b->crowd.scan_ms = (uint16_t)MIN(scan_ms, 0xFFFFu);
         if(b->scans < 255) b->scans++;
         if(b->dropped) FURI_LOG_D(TAG, "ble: %lu reports dropped", b->dropped);
         ble_emit_crowd(b, 0);
+        ST_LOCK(s);
+        s->rec.st.observer_ok = s->observer_ok;
+        s->rec.st.ble_seen = b->crowd.seen;
+        s->rec.st.ble_window = b->crowd.win_distinct;
+        s->rec.st.ble_tick = furi_get_tick();
+        ST_UNLOCK(s);
     }
     return 0;
 }
@@ -1471,9 +1713,10 @@ static size_t build_announce(HoneSrv* s, uint8_t* out) {
 /* Advert (31 B): [len][0xFF][company lo][company hi]['H'][kind][seq][idx<<4 | total][data <= 23]
  * kind 'A' = signed announce frame, 'C' = signed batch commit. */
 static void send_fragments(
+    const HoneSrv* s,
     uint8_t* adv, char kind, uint8_t seq, const uint8_t* data, size_t len, bool* started) {
     uint8_t total = (uint8_t)((len + HONE_FRAG_DATA - 1) / HONE_FRAG_DATA);
-    for(uint8_t i = 0; i < total; i++) {
+    for(uint8_t i = 0; i < total && !hone_should_yield(s); i++) {
         size_t off = (size_t)i * HONE_FRAG_DATA;
         size_t n = MIN((size_t)HONE_FRAG_DATA, len - off);
         adv[0] = (uint8_t)(7 + n);
@@ -1509,7 +1752,7 @@ static void id_slot(HoneSrv* s, HoneWindowKey* key, const GapExtraBeaconConfig* 
     uint32_t left_ms = (HONE_WINDOW_S - utc % HONE_WINDOW_S) * 1000u;
     if(*started) furi_hal_bt_extra_beacon_stop();
     *started = false;
-    for(uint8_t half = 0; half < 2 && left_ms; half++) {
+    for(uint8_t half = 0; half < 2 && left_ms && !hone_should_yield(s); half++) {
         GapExtraBeaconConfig cfg = *home;
         cfg.address_type = GapAddressTypeRandom;
         memcpy(cfg.address, key->addr[half], 6);
@@ -1566,10 +1809,12 @@ static int32_t announce_lane(void* ctx) {
             s->beacon_held = false;
             continue;
         }
-        if(s->paused) {
-            if(started) furi_hal_bt_extra_beacon_stop();
-            started = false;
-            furi_delay_ms(1000);
+        if(!lane_enter(s, HoneLaneAnnounce)) {
+            /* parked; never touch the stack while another app may be
+             * restarting it (the beacon was stopped when we parked) */
+            if(started && !s->app_hold) furi_hal_bt_extra_beacon_stop();
+            if(!s->app_hold) started = false;
+            furi_delay_ms(500);
             continue;
         }
         if(!len || furi_get_tick() - built > furi_ms_to_ticks(HONE_ANNOUNCE_EVERY_MS)) {
@@ -1577,7 +1822,7 @@ static int32_t announce_lane(void* ctx) {
             built = furi_get_tick();
             seq++;
         }
-        send_fragments(adv, 'A', seq, frame, len, &started);
+        send_fragments(s, adv, 'A', seq, frame, len, &started);
         batches_flush(s);
         /* One commit per cycle, round-robin, so the announce (which receivers need
          * first) keeps most of the airtime. */
@@ -1589,10 +1834,21 @@ static int32_t announce_lane(void* ctx) {
                 c->made = 0;
                 continue;
             }
-            send_fragments(adv, 'C', c->seq, c->data, HONE_COMMIT_LEN, &started);
+            send_fragments(s, adv, 'C', c->seq, c->data, HONE_COMMIT_LEN, &started);
             break;
         }
         if(s->seed_ok) id_slot(s, &idkey, &cfg, &started);
+        if(hone_should_yield(s) && started) {
+            furi_hal_bt_extra_beacon_stop();
+            started = false;
+        }
+        lane_leave(s, HoneLaneAnnounce);
+        ST_LOCK(s);
+        s->rec.st.beacon_on = started;
+        s->rec.st.id_advert = s->seed_ok;
+        s->rec.st.announce_seq = seq;
+        s->rec.st.announce_tick = built;
+        ST_UNLOCK(s);
     }
     return 0;
 }
@@ -1608,13 +1864,27 @@ int32_t hone_srv(void* p) {
     UNUSED(p);
     HoneSrv* s = malloc(sizeof(HoneSrv));
     memset(s, 0, sizeof(HoneSrv));
+    s->rec.lock = furi_mutex_alloc(FuriMutexTypeNormal);
+    s->otg_lock = furi_mutex_alloc(FuriMutexTypeNormal);
+    strlcpy(s->rec.st.fw, HONE_FW_VERSION, sizeof(s->rec.st.fw));
+    strlcpy(s->rec.st.boot_reason, "(waiting for SD card)", sizeof(s->rec.st.boot_reason));
+    furi_record_create(RECORD_HONE, &s->rec);
     s->storage = furi_record_open(RECORD_STORAGE);
+
+    /* "H" in the desktop status bar: solid = sensing, hollow = paused/yielding */
+    ViewPort* icon = view_port_alloc();
+    view_port_set_width(icon, 7);
+    view_port_draw_callback_set(icon, statusbar_draw, s);
+    Gui* gui = furi_record_open(RECORD_GUI);
+    gui_add_view_port(gui, icon, GuiLayerStatusBarLeft);
+    furi_record_close(RECORD_GUI);
 
     /* Wait for the SD card: identity, counter and queue all live there. */
     while(storage_sd_status(s->storage) != FSE_OK) {
         furi_delay_ms(1000);
     }
     storage_simply_mkdir(s->storage, HONE_DIR);
+    boot_record(s);
 
     identity_load_or_create(s);
     counter_load(s);
@@ -1642,22 +1912,72 @@ int32_t hone_srv(void* p) {
     lane_start("HoneAnnounce", announce_lane, s);
     lane_start("HoneBle", ble_lane, s);
 
+    /* Release the sensors whenever another app starts (see lane_enter). */
+    Loader* loader = furi_record_open(RECORD_LOADER);
+    furi_pubsub_subscribe(loader_get_pubsub(loader), loader_event_cb, s);
+    /* Show the Hone screen once after boot, so HONE is visible on the device.
+     * The loader can be busy right after boot (update result, PIN lock):
+     * retry for about a minute, then give up quietly. */
+    uint8_t autostart_left = 12;
+    uint32_t autostart_tick = furi_get_tick();
+
+    static const char* const sensor_name[HoneSensorCount] =
+        {"Sub-GHz", "NFC", "RFID", "iButton", "IR", "Wi-Fi", "heartbt"};
     uint32_t last_maint_check = furi_get_tick();
+    bool shown_yield = false;
     while(1) {
         if(furi_get_tick() - last_maint_check > furi_ms_to_ticks(5000)) {
             s->paused = storage_file_exists(s->storage, HONE_MAINT_PATH);
             owner_load(s); /* picks up a claim without a reboot */
             seed_load(s);  /* and a provisioned (or removed) id seed */
             tz_load(s);
+            ST_LOCK(s);
+            memcpy(s->rec.st.owner, s->owner, sizeof(s->owner));
+            s->rec.st.owner[sizeof(s->owner)] = 0;
+            ST_UNLOCK(s);
             last_maint_check = furi_get_tick();
         }
-        if(s->paused) {
-            furi_delay_ms(1000);
+        /* BeforeLoad has no matching event when a start is refused (app not
+         * found, loader locked): drop a hold that has no running app behind it. */
+        if(s->app_hold && furi_get_tick() - s->hold_tick > furi_ms_to_ticks(5000) &&
+           !loader_is_locked(loader)) {
+            s->app_hold = false;
+            s->rec.ui_open = false;
+        }
+        if(autostart_left &&
+           furi_get_tick() - autostart_tick > furi_ms_to_ticks(5000)) {
+            autostart_tick = furi_get_tick();
+            autostart_left--;
+            if(!loader_is_locked(loader) &&
+               loader_start(loader, "Hone", NULL, NULL) == LoaderStatusOk)
+                autostart_left = 0;
+        }
+        bool yield = hone_should_yield(s);
+        if(yield != shown_yield) {
+            shown_yield = yield;
+            ST_LOCK(s);
+            s->rec.st.paused = s->paused;
+            s->rec.st.yielding = yield && !s->paused;
+            ST_UNLOCK(s);
+            view_port_update(icon);
+        }
+        if(yield) {
+            furi_delay_ms(500);
             continue;
         }
         hone_sched_set_battery(&s->sched, furi_hal_power_get_pct());
         HoneSensorKind k = hone_sched_next(&s->sched);
-        hone_sched_report(&s->sched, k, run_slot(s, k));
+        if(k >= HoneSensorCount) {
+            /* every tag sensor is backed off (no card, no remote): idle one slot */
+            furi_delay_ms(HONE_SLOT_MS);
+            continue;
+        }
+        if(!lane_enter(s, HoneLaneTag)) continue;
+        status_tag_lane(s, sensor_name[k]);
+        bool found = run_slot(s, k);
+        lane_leave(s, HoneLaneTag); /* NFC/RFID/iButton/IR all released */
+        status_tag_lane(s, "");
+        hone_sched_report(&s->sched, k, found);
         furi_delay_ms(hone_sched_cycle_delay_ms(&s->sched));
     }
     return 0;

@@ -70,6 +70,7 @@ FIRMWARE_APPS = {
         "basic_services",
         # HONE owns every sensor. No Sub-GHz/NFC/RFID/iButton/IR/JS apps.
         "hone",
+        "hone_app",  # the Hone screen (main menu)
         "updater_app",
         "gpio",
         "archive",
