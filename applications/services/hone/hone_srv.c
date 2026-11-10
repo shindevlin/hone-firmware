@@ -632,21 +632,28 @@ static void alive_touch(HoneSrv* s) {
     write_file(s->storage, HONE_ALIVE_PATH, &now, sizeof(now));
 }
 
-/* ─── desktop status-bar icon: a small "H" while HONE runs ──────────────── */
+/* ─── desktop status-bar icon: a tiny kiskadee head ──────────────────────
+ * black crown, white brow, black mask with the eye, heavy beak, white throat.
+ * Eye shut while HONE is paused or yielding to another app. */
+
+static const uint8_t statusbar_head[8][9] = {
+    {0, 0, 1, 1, 1, 1, 0, 0, 0},
+    {0, 1, 1, 1, 1, 1, 1, 0, 0},
+    {1, 0, 0, 0, 0, 0, 0, 1, 0},
+    {1, 1, 1, 1, 0, 1, 1, 1, 1},
+    {1, 1, 1, 1, 1, 1, 1, 1, 0},
+    {1, 0, 0, 0, 0, 0, 0, 1, 0},
+    {0, 1, 0, 0, 0, 0, 1, 0, 0},
+    {0, 0, 1, 1, 1, 1, 0, 0, 0},
+};
 
 static void statusbar_draw(Canvas* canvas, void* ctx) {
     HoneSrv* s = ctx;
-    /* 7x8 box with an H; hollow while paused or yielding */
-    if(hone_should_yield(s)) {
-        canvas_draw_frame(canvas, 0, 0, 7, 8);
-    } else {
-        canvas_draw_box(canvas, 0, 0, 7, 8);
-        canvas_set_color(canvas, ColorWhite);
-    }
-    canvas_draw_line(canvas, 2, 2, 2, 5);
-    canvas_draw_line(canvas, 4, 2, 4, 5);
-    canvas_draw_dot(canvas, 3, 4);
-    canvas_set_color(canvas, ColorBlack);
+    bool shut = hone_should_yield(s);
+    for(int y = 0; y < 8; y++)
+        for(int x = 0; x < 9; x++)
+            if(statusbar_head[y][x] || (shut && y == 3 && x == 4))
+                canvas_draw_dot(canvas, x, y);
 }
 
 static void queue_append(HoneSrv* s, const uint8_t* frame, size_t len) {
@@ -1871,9 +1878,9 @@ int32_t hone_srv(void* p) {
     furi_record_create(RECORD_HONE, &s->rec);
     s->storage = furi_record_open(RECORD_STORAGE);
 
-    /* "H" in the desktop status bar: solid = sensing, hollow = paused/yielding */
+    /* kiskadee head in the desktop status bar: eye shut = paused/yielding */
     ViewPort* icon = view_port_alloc();
-    view_port_set_width(icon, 7);
+    view_port_set_width(icon, 9);
     view_port_draw_callback_set(icon, statusbar_draw, s);
     Gui* gui = furi_record_open(RECORD_GUI);
     gui_add_view_port(gui, icon, GuiLayerStatusBarLeft);

@@ -13,14 +13,23 @@
 #include <gui/gui.h>
 #include <input/input.h>
 #include <datetime/datetime.h>
+#include "kiskadee_sprites.h"
 
-#define HONE_PAGES 3
+#define HONE_PAGES 4
 
 typedef struct {
     HoneStatusRecord* rec;
     HoneStatus st;
     FuriMutex* lock;
     uint8_t page;
+    /* kiskadee */
+    uint8_t mood;
+    uint32_t mood_until;
+    uint32_t last_event;
+    uint32_t anim;
+    HoneStatus prev;
+    bool have_prev;
+    char say[24];
 } HoneApp;
 
 static void fmt_dur(char* out, size_t n, uint32_t s) {
@@ -45,6 +54,142 @@ static void fmt_ago(char* out, size_t n, uint32_t tick) {
     snprintf(out, n, "%s", d);
 }
 
+/* ─── the kiskadee: mood follows what HoneSrv is really doing ──────────── */
+
+typedef enum {
+    MoodScan,  /* default: head turns, radio icon for the lane */
+    MoodFound, /* crest up, "kis-ka-dee!" */
+    MoodSend,  /* wing flap: an announce or commit went out */
+    MoodSleep, /* on battery and idle, or paused/yielding */
+    MoodHurt,  /* just rebooted: shows why */
+} Mood;
+
+#define FOUND_MS 3000u
+#define SEND_MS  1500u
+#define IDLE_MS  60000u
+
+static bool tick_due(uint32_t until) {
+    return (int32_t)(furi_get_tick() - until) >= 0;
+}
+
+/* Called with app->lock held, right after a fresh status copy. */
+static void mood_update(HoneApp* app) {
+    const HoneStatus* st = &app->st;
+    const HoneStatus* pv = &app->prev;
+    uint32_t now = furi_get_tick();
+    if(app->have_prev) {
+        char what[24] = {0};
+        if(st->last_tag_tick != pv->last_tag_tick && st->last_tag[0]) {
+            strlcpy(what, st->last_tag, sizeof(what));
+        } else if(
+            st->wifi_tick != pv->wifi_tick && pv->wifi_tick && st->wifi_aps > pv->wifi_aps) {
+            snprintf(what, sizeof(what), "new Wi-Fi: %u APs", st->wifi_aps);
+        } else if(st->subghz_tick != pv->subghz_tick && st->subghz_peak >= -65) {
+            snprintf(
+                what, sizeof(what), "%lu.%02lu %ddBm", (unsigned long)(st->subghz_freq / 1000000),
+                (unsigned long)(st->subghz_freq / 10000 % 100), st->subghz_peak);
+        }
+        if(what[0]) {
+            app->mood = MoodFound;
+            app->mood_until = now + furi_ms_to_ticks(FOUND_MS);
+            app->last_event = now;
+            strlcpy(app->say, what, sizeof(app->say));
+        } else if(
+            (app->mood != MoodFound || tick_due(app->mood_until)) &&
+            (st->announce_tick != pv->announce_tick || st->commits != pv->commits)) {
+            app->mood = MoodSend;
+            app->mood_until = now + furi_ms_to_ticks(SEND_MS);
+        }
+    } else {
+        app->last_event = now;
+    }
+    app->prev = *st;
+    app->have_prev = true;
+    if((app->mood == MoodFound || app->mood == MoodSend) && !tick_due(app->mood_until)) return;
+
+    uint32_t up = now / furi_kernel_get_tick_frequency();
+    bool crash = strncmp(st->boot_reason, "crash", 5) == 0;
+    bool ext = furi_hal_power_get_usb_voltage() > 4.5f;
+    if(up < 60 || (crash && up < 600))
+        app->mood = MoodHurt;
+    else if(
+        st->paused || st->yielding ||
+        (!ext && !st->tag_lane[0] && now - app->last_event > furi_ms_to_ticks(IDLE_MS)))
+        app->mood = MoodSleep;
+    else
+        app->mood = MoodScan;
+}
+
+/* tiny radio mast with two waves, baseline at y */
+static void draw_radio(Canvas* c, int x, int y) {
+    canvas_draw_line(c, x + 3, y - 6, x + 3, y);
+    canvas_draw_line(c, x + 1, y, x + 5, y);
+    canvas_draw_dot(c, x + 1, y - 5);
+    canvas_draw_dot(c, x + 5, y - 5);
+    canvas_draw_dot(c, x + 0, y - 6);
+    canvas_draw_dot(c, x + 6, y - 6);
+}
+
+static void draw_kiskadee(Canvas* canvas, HoneApp* app) {
+    const HoneStatus* st = &app->st;
+    char l[40];
+    KiskadeeFrame f;
+    switch(app->mood) {
+    case MoodFound: f = KiskadeeFrame_found; break;
+    case MoodSend: f = (app->anim & 1) ? KiskadeeFrame_send_flap : KiskadeeFrame_idle; break;
+    case MoodSleep: f = KiskadeeFrame_sleep; break;
+    case MoodHurt: f = KiskadeeFrame_hurt; break;
+    default: f = (app->anim / 4) & 1 ? KiskadeeFrame_scan_turn : KiskadeeFrame_idle; break;
+    }
+    canvas_draw_xbm(canvas, 0, 64 - KISKADEE_H, KISKADEE_W, KISKADEE_H, kiskadee_frames[f]);
+
+    const int x = 44;
+    canvas_set_font(canvas, FontSecondary);
+    if(app->mood == MoodFound) {
+        /* speech bubble from the beak */
+        canvas_draw_rframe(canvas, x, 13, 80, 13, 3);
+        canvas_draw_line(canvas, x, 23, x - 4, 28);
+        canvas_draw_line(canvas, x - 4, 28, x + 4, 25);
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str(canvas, x + 6, 23, "kis-ka-dee!");
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str(canvas, x, 36, "found:");
+        canvas_draw_str(canvas, x, 45, app->say);
+    } else if(app->mood == MoodSend) {
+        canvas_draw_str(canvas, x, 21, "sending...");
+        snprintf(l, sizeof(l), "BLE announce #%u", st->announce_seq);
+        canvas_draw_str(canvas, x, 30, l);
+        snprintf(l, sizeof(l), "commits %lu", (unsigned long)st->commits);
+        canvas_draw_str(canvas, x, 39, l);
+    } else if(app->mood == MoodSleep) {
+        uint8_t z = (app->anim / 3) % 3;
+        canvas_draw_str(canvas, 36, 26 - z * 3, "z");
+        if(z) canvas_draw_str(canvas, 40, 20 - z * 3, "Z");
+        canvas_draw_str(canvas, x, 21, "sleeping");
+        canvas_draw_str(
+            canvas, x, 30,
+            st->paused   ? "paused (maint.)" :
+            st->yielding ? "other app running" :
+                           "on battery, quiet");
+    } else if(app->mood == MoodHurt) {
+        canvas_draw_str(canvas, x, 21, "ouch, rebooted:");
+        size_t n = strlen(st->boot_reason);
+        strlcpy(l, st->boot_reason, MIN(n, (size_t)17) + 1);
+        canvas_draw_str(canvas, x, 30, l);
+        if(n > 17) canvas_draw_str(canvas, x, 39, st->boot_reason + 17);
+    } else {
+        canvas_draw_str(canvas, x, 21, "scanning");
+        draw_radio(canvas, x, 30);
+        canvas_draw_str(canvas, x + 10, 30, st->tag_lane[0] ? st->tag_lane : "Sub-GHz");
+        snprintf(l, sizeof(l), "BLE %s #%u", st->beacon_on ? "on" : "off", st->announce_seq);
+        canvas_draw_str(canvas, x, 39, l);
+    }
+    char a[12];
+    fmt_dur(a, sizeof(a), furi_get_tick() / furi_kernel_get_tick_frequency());
+    snprintf(l, sizeof(l), "up %s  %lu fr", a, (unsigned long)st->frames);
+    canvas_draw_str(canvas, x, 63, l);
+}
+
 static void draw_cb(Canvas* canvas, void* ctx) {
     HoneApp* app = ctx;
     furi_check(furi_mutex_acquire(app->lock, FuriWaitForever) == FuriStatusOk);
@@ -56,19 +201,21 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str(canvas, 0, 9, "HONE");
     canvas_set_font(canvas, FontSecondary);
-    static const char* const titles[HONE_PAGES] = {"status", "readings", "reboot"};
+    static const char* const titles[HONE_PAGES] = {"kiskadee", "status", "readings", "reboot"};
     canvas_draw_str(canvas, 30, 9, titles[app->page]);
     for(uint8_t i = 0; i < HONE_PAGES; i++) {
         if(i == app->page)
-            canvas_draw_box(canvas, 110 + i * 6, 4, 4, 4);
+            canvas_draw_box(canvas, 104 + i * 6, 4, 4, 4);
         else
-            canvas_draw_frame(canvas, 110 + i * 6, 4, 4, 4);
+            canvas_draw_frame(canvas, 104 + i * 6, 4, 4, 4);
     }
     canvas_draw_line(canvas, 0, 10, 127, 10);
 
     int y = 19;
     const int dy = 9;
     if(app->page == 0) {
+        draw_kiskadee(canvas, app);
+    } else if(app->page == 1) {
         snprintf(
             l, sizeof(l), "Service: %s",
             st->paused   ? "PAUSED (maint.)" :
@@ -96,7 +243,7 @@ static void draw_cb(Canvas* canvas, void* ctx) {
             l, sizeof(l), "frames %lu  commits %lu", (unsigned long)st->frames,
             (unsigned long)st->commits);
         canvas_draw_str(canvas, 0, y, l);
-    } else if(app->page == 1) {
+    } else if(app->page == 2) {
         fmt_ago(a, sizeof(a), st->subghz_tick);
         snprintf(
             l, sizeof(l), "SubG %lu.%02lu %ddBm", (unsigned long)(st->subghz_freq / 1000000),
@@ -191,7 +338,7 @@ int32_t hone_app(void* p) {
     InputEvent ev;
     bool run = true;
     while(run) {
-        if(furi_message_queue_get(q, &ev, 1000) == FuriStatusOk) {
+        if(furi_message_queue_get(q, &ev, 250) == FuriStatusOk) {
             if(ev.type == InputTypeShort || ev.type == InputTypeRepeat) {
                 furi_check(furi_mutex_acquire(app->lock, FuriWaitForever) == FuriStatusOk);
                 if(ev.key == InputKeyBack) run = false;
@@ -204,6 +351,8 @@ int32_t hone_app(void* p) {
         }
         furi_check(furi_mutex_acquire(app->lock, FuriWaitForever) == FuriStatusOk);
         hone_status_get(app->rec, &app->st);
+        mood_update(app);
+        app->anim++;
         furi_mutex_release(app->lock);
         view_port_update(vp);
     }
