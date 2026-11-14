@@ -33,7 +33,7 @@
 #include <mbedtls/md.h>
 #include <soc/rtc_cntl_reg.h>
 
-#define HONE_ESP_VER "0.2.0"
+#define HONE_ESP_VER "0.3.0"
 #define LINK_TX 43
 #define LINK_RX 44
 #define LINK_BAUD 230400
@@ -86,11 +86,23 @@ static uint32_t mac_hash(const uint8_t* m) {
     return h;
 }
 
+// 0.3: channel load (frames heard per channel) and deauth/disassoc counting
+static volatile uint8_t cur_ch_idx;
+static volatile uint32_t ch_frames[3];
+static uint32_t ch_ms[3];
+static volatile uint16_t deauth_count;
+
 static void IRAM_ATTR sniff(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if(cur_ch_idx < 3) ch_frames[cur_ch_idx]++;
     if(type != WIFI_PKT_MGMT) return;
     const wifi_promiscuous_pkt_t* p = (const wifi_promiscuous_pkt_t*)buf;
     const uint8_t* f = p->payload;
-    if((f[0] & 0xFC) != 0x40) return; // management, subtype 4 = probe request
+    uint8_t st = f[0] & 0xFC;
+    if(st == 0xC0 || st == 0xA0) { // deauthentication / disassociation
+        if(deauth_count < 0xFFFF) deauth_count++;
+        return;
+    }
+    if(st != 0x40) return; // management, subtype 4 = probe request
     probe_count++;
     uint32_t h;
     if(keyed_uniq) {
@@ -108,25 +120,35 @@ static void IRAM_ATTR sniff(void* buf, wifi_promiscuous_pkt_type_t type) {
 static void count_probes(uint16_t* probes, uint8_t* u, uint32_t listen_ms = 0) {
     probe_count = 0;
     uniq_n = 0;
+    deauth_count = 0;
+    for(int i = 0; i < 3; i++) ch_frames[i] = ch_ms[i] = 0;
     esp_wifi_set_promiscuous_rx_cb(sniff);
-    wifi_promiscuous_filter_t filt = {.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT};
+    wifi_promiscuous_filter_t filt = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA};
     esp_wifi_set_promiscuous_filter(&filt);
     esp_wifi_set_promiscuous(true);
     if(!listen_ms) {
-        for(uint8_t c : PROBE_CHANNELS) {
-            esp_wifi_set_channel(c, WIFI_SECOND_CHAN_NONE);
+        for(uint8_t i = 0; i < 3; i++) {
+            cur_ch_idx = i;
+            esp_wifi_set_channel(PROBE_CHANNELS[i], WIFI_SECOND_CHAN_NONE);
             delay(PROBE_DWELL_MS);
+            ch_ms[i] += PROBE_DWELL_MS;
         }
     } else {
         // continuous: hop 1/6/11 every PROBE_DWELL_MS until listen_ms is used up
         uint32_t t0 = millis();
         for(uint8_t i = 0; millis() - t0 < listen_ms; i++) {
-            esp_wifi_set_channel(PROBE_CHANNELS[i % sizeof(PROBE_CHANNELS)], WIFI_SECOND_CHAN_NONE);
+            uint8_t k = i % sizeof(PROBE_CHANNELS);
+            cur_ch_idx = k;
+            esp_wifi_set_channel(PROBE_CHANNELS[k], WIFI_SECOND_CHAN_NONE);
             uint32_t left = listen_ms - (millis() - t0);
-            delay(left < PROBE_DWELL_MS ? left : PROBE_DWELL_MS);
+            uint32_t d = left < PROBE_DWELL_MS ? left : PROBE_DWELL_MS;
+            delay(d);
+            ch_ms[k] += d;
         }
     }
     esp_wifi_set_promiscuous(false);
+    cur_ch_idx = 3;
     *probes = probe_count;
     *u = uniq_n;
 }
@@ -157,6 +179,7 @@ static void do_scan2(Print& out, uint32_t listen_ms) {
     int n = WiFi.scanNetworks(false, true);
     uint8_t ch[14] = {0};
     int best = -127, la = 0;
+    uint16_t sec[7] = {0}; // open, wep, wpa, wpa2, wpa3, enterprise, wps
     int idx[TOP_N];
     int ntop = 0;
     for(int i = 0; i < n; i++) {
@@ -165,6 +188,20 @@ static void do_scan2(Print& out, uint32_t listen_ms) {
         if(WiFi.RSSI(i) > best) best = WiFi.RSSI(i);
         const uint8_t* b = WiFi.BSSID(i);
         if(b && (b[0] & 0x02)) la++;
+        // security census: counts only
+        switch(WiFi.encryptionType(i)) {
+        case WIFI_AUTH_OPEN: sec[0]++; break;
+        case WIFI_AUTH_WEP: sec[1]++; break;
+        case WIFI_AUTH_WPA_PSK: sec[2]++; break;
+        case WIFI_AUTH_WPA2_PSK:
+        case WIFI_AUTH_WPA_WPA2_PSK: sec[3]++; break;
+        case WIFI_AUTH_WPA3_PSK:
+        case WIFI_AUTH_WPA2_WPA3_PSK: sec[4]++; break;
+        case WIFI_AUTH_WPA2_ENTERPRISE: sec[5]++; break;
+        default: break;
+        }
+        const wifi_ap_record_t* r = (const wifi_ap_record_t*)WiFi.getScanInfoByIndex(i);
+        if(r && r->wps) sec[6]++;
     }
     // top APs by RSSI, strongest first (selection; n is small)
     bool used[256] = {false};
@@ -194,8 +231,19 @@ static void do_scan2(Print& out, uint32_t listen_ms) {
     keyed_uniq = false;
     out.printf("WIFI2 aps=%d la=%d best=%d ch=", n < 0 ? 0 : n, la, n > 0 ? best : 0);
     for(int c = 1; c <= 13; c++) out.printf(c < 13 ? "%u," : "%u", ch[c]);
-    out.printf(" probes=%u uniq=%u listen=%lu top=%s ms=%lu\n", probes, u, (unsigned long)(listen_ms / 1000),
-               top.length() ? top.c_str() : "-", (unsigned long)(millis() - t0));
+    out.printf(" probes=%u uniq=%u listen=%lu top=%s", probes, u, (unsigned long)(listen_ms / 1000),
+               top.length() ? top.c_str() : "-");
+    // 0.3: security census, probe senders as 4-byte keyed oids (never MACs),
+    // frames/s per channel 1/6/11, deauth+disassoc frames
+    out.printf(" sec=%u,%u,%u,%u,%u,%u,%u", sec[0], sec[1], sec[2], sec[3], sec[4], sec[5], sec[6]);
+    out.print(" pso=");
+    if(!uniq_n) out.print("-");
+    for(uint8_t i = 0; i < uniq_n && i < 32; i++) out.printf(i ? ",%08lx" : "%08lx", (unsigned long)uniq[i]);
+    out.printf(" cu=%lu,%lu,%lu deauth=%u ms=%lu\n",
+               (unsigned long)(ch_ms[0] ? ch_frames[0] * 1000 / ch_ms[0] : 0),
+               (unsigned long)(ch_ms[1] ? ch_frames[1] * 1000 / ch_ms[1] : 0),
+               (unsigned long)(ch_ms[2] ? ch_frames[2] * 1000 / ch_ms[2] : 0),
+               deauth_count, (unsigned long)(millis() - t0));
 }
 
 static void handle(const String& cmd, Print& out) {
