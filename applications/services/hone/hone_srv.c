@@ -59,13 +59,22 @@
 #include <datetime/datetime.h>
 #include "crypto/tweetnacl.h"
 #include "hone_status.h"
+#include "hone_census.h"
+#include <lib/subghz/receiver.h>
+#include <toolbox/level_duration.h>
+#include <lib/subghz/environment.h>
+#include <lib/subghz/protocols/protocol_items.h>
+#include <lib/subghz/devices/cc1101_configs.h>
+#include <furi_hal_nfc.h>
+#include <furi_hal_rfid.h>
+#include <notification/notification_messages.h>
 #include <loader/loader.h>
 #include <gui/gui.h>
 #include <stm32wbxx_ll_rcc.h>
 #include <stdlib.h>
 
 #define TAG "HoneSrv"
-#define HONE_FW_VERSION "2.1.1"
+#define HONE_FW_VERSION "2.2.0"
 
 #define HONE_DIR         EXT_PATH("apps_data/hone")
 #define HONE_KEY_PATH    HONE_DIR "/identity.key"
@@ -94,6 +103,20 @@
 #define HONE_TZ_PATH     HONE_DIR "/utc_offset_min"
 #define HONE_BOOT_LOG    HONE_DIR "/boot.log"  /* one line per boot: time, reset cause, downtime */
 #define HONE_ALIVE_PATH  HONE_DIR "/alive.bin" /* u32 RTC, refreshed every minute */
+/* capture log (v3 chain). chain.bin = HoneChainState, rewritten every
+ * HONE_CHAIN_SAVE_EVERY frames and at each rotation; on boot the tail of
+ * queue.bin after .offset is replayed, so the head is never lost.
+ * heads.bin  = every signed chain head the Flipper broadcast (HoneHeadRec).
+ * ack.bin    = u32 seq, written by a HONE phone once it has verified and stored
+ *              every frame up to seq. Only archives fully <= ack may ever be
+ *              deleted, and only when the SD runs low. */
+#define HONE_CHAIN_PATH  HONE_DIR "/chain.bin"
+#define HONE_HEADS_PATH  HONE_DIR "/heads.bin"
+#define HONE_ACK_PATH    HONE_DIR "/ack.bin"
+#define HONE_CHAIN_MAGIC 0x31484348u /* "HCH1" */
+#define HONE_CHAIN_SAVE_EVERY 32u
+#define HONE_SD_LOW_MB   128u /* below: delete the oldest delivered archive */
+#define HONE_SD_ECON_MB  32u  /* below, nothing deletable: economy mode */
 #define HONE_UTC_OFFSET_DEFAULT (-360) /* America/El_Salvador, UTC-6, no DST */
 
 /* ─── batch commits ───────────────────────────────────────────────────────
@@ -151,6 +174,7 @@ struct HoneStatusRecord {
     FuriMutex* lock;
     HoneStatus st;
     volatile bool ui_open;
+    volatile bool want_reprobe; /* screen opened: maybe a board was just plugged in */
 };
 
 typedef struct {
@@ -193,8 +217,43 @@ typedef struct {
     volatile uint32_t hold_tick;
     volatile bool busy[HoneLaneCount];
     FuriMutex* otg_lock; /* Wi-Fi board power vs the iButton reader's 5 V request */
+    /* TIM2 is shared by Sub-GHz async RX (decoding), IR and 125 kHz RFID:
+     * the tag lane holds it for its slots, the Sub-GHz lane only tries. */
+    FuriMutex* tim_lock;
     HoneStatusRecord rec;
+    /* capture log chain (guarded by emit_lock) */
+    uint8_t chain_head[32]; /* sha256 of the newest queued frame */
+    uint32_t chain_seq;     /* its counter */
+    uint32_t queue_first;   /* counter of the first frame in queue.bin */
+    uint32_t chain_unsaved;
+    volatile bool economy;  /* SD nearly full of undelivered data */
+    /* where are we: fingerprint of the strongest Wi-Fi APs (oids), 0 = unknown */
+    volatile uint32_t loc_fp;
+    /* Wi-Fi dev board: seen at the last probe; re-probe request (USB power came,
+     * or the Hone screen was opened) */
+    volatile bool wifi_board;
+    volatile bool wifi_reprobe;
+    /* main loop launches the Hone screen for an alert */
+    volatile bool want_screen;
+    NotificationApp* notif;
 } HoneSrv;
+
+/* chain.bin */
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t seq;         /* counter of the newest frame folded into head */
+    uint32_t queue_first; /* counter of the first frame in queue.bin */
+    uint32_t offset;      /* queue.bin size when saved */
+    uint8_t head[32];
+} HoneChainState;
+
+/* heads.bin record; the 'HH' beacon carries devid | seq | rtc | head16 | sig */
+typedef struct __attribute__((packed)) {
+    uint32_t seq;
+    uint32_t rtc;
+    uint8_t head[16];
+    uint8_t sig[64]; /* ed25519 over "HH1" | devid8 | seq | rtc | head16 */
+} HoneHeadRec;
 
 _Static_assert(sizeof(HoneBodyBleCrowd) == 29, "crowd body");
 _Static_assert(sizeof(HoneSighting) == 20, "sighting entry");
@@ -543,12 +602,39 @@ void hone_status_get(HoneStatusRecord* rec, HoneStatus* out) {
 void hone_status_ui_open(HoneStatusRecord* rec, bool open) {
     furi_check(rec);
     rec->ui_open = open;
+    if(open) rec->want_reprobe = true;
 }
 
 static void status_tag_lane(HoneSrv* s, const char* name) {
     ST_LOCK(s);
     strlcpy(s->rec.st.tag_lane, name, sizeof(s->rec.st.tag_lane));
     ST_UNLOCK(s);
+}
+
+/* A new find for the Hone screen (and the kiskadee's "found" mood). */
+static void find_push(HoneSrv* s, const char* text) {
+    ST_LOCK(s);
+    HoneStatus* st = &s->rec.st;
+    memmove(st->finds[1], st->finds[0], sizeof(st->finds[0]) * (HONE_FINDS - 1));
+    memmove(&st->find_tick[1], &st->find_tick[0], sizeof(st->find_tick[0]) * (HONE_FINDS - 1));
+    strlcpy(st->finds[0], text, sizeof(st->finds[0]));
+    st->find_tick[0] = furi_get_tick();
+    st->find_seq++;
+    ST_UNLOCK(s);
+    FURI_LOG_I(TAG, "find: %s", text);
+}
+
+/* Something the owner should see now: buzz, blink, and bring up the screen. */
+static void alert_raise(HoneSrv* s, const char* l1, const char* l2) {
+    ST_LOCK(s);
+    strlcpy(s->rec.st.alert[0], l1, sizeof(s->rec.st.alert[0]));
+    strlcpy(s->rec.st.alert[1], l2, sizeof(s->rec.st.alert[1]));
+    s->rec.st.alert_seq++;
+    s->rec.st.alert_tick = furi_get_tick();
+    ST_UNLOCK(s);
+    FURI_LOG_W(TAG, "ALERT %s / %s", l1, l2);
+    if(s->notif) notification_message(s->notif, &sequence_error);
+    s->want_screen = true;
 }
 
 static void loader_event_cb(const void* message, void* context) {
@@ -656,56 +742,272 @@ static void statusbar_draw(Canvas* canvas, void* ctx) {
                 canvas_draw_dot(canvas, x, y);
 }
 
-static void queue_append(HoneSrv* s, const uint8_t* frame, size_t len) {
-    FileInfo fi;
-    if(storage_common_stat(s->storage, HONE_QUEUE_PATH, &fi) == FSE_OK &&
-       fi.size > HONE_QUEUE_MAX) {
-        /* Keep every rotated queue: it is the evidence the signed batch hashes
-         * commit to, and the SD card has room for years of it. */
-        char path[64];
-        storage_common_mkdir(s->storage, HONE_ARCHIVE_DIR);
-        snprintf(path, sizeof(path), HONE_ARCHIVE_DIR "/q-%lu.bin", (unsigned long)furi_hal_rtc_get_timestamp());
-        storage_common_rename(s->storage, HONE_QUEUE_PATH, path);
-    }
+/* ─── capture log: hash chain over queue.bin ──────────────────────────────
+ * Every queued frame is v3 and carries prev = sha256(previous frame)[0..16];
+ * chain_head is sha256 of the newest one. Called with emit_lock held. */
+
+static void chain_save(HoneSrv* s, uint32_t offset) {
+    HoneChainState c = {
+        .magic = HONE_CHAIN_MAGIC,
+        .seq = s->chain_seq,
+        .queue_first = s->queue_first,
+        .offset = offset,
+    };
+    memcpy(c.head, s->chain_head, 32);
+    write_file(s->storage, HONE_CHAIN_PATH, &c, sizeof(c));
+    s->chain_unsaved = 0;
+}
+
+/* Fold frames from queue.bin (starting at offset) into the head. */
+static void chain_replay(HoneSrv* s, uint32_t offset) {
     File* f = storage_file_alloc(s->storage);
-    if(storage_file_open(f, HONE_QUEUE_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
-        uint8_t l = (uint8_t)len; /* frames are <= 128 bytes */
-        storage_file_write(f, &l, 1);
-        storage_file_write(f, frame, len);
+    uint8_t* buf = malloc(256);
+    if(storage_file_open(f, HONE_QUEUE_PATH, FSAM_READ, FSOM_OPEN_EXISTING) &&
+       storage_file_seek(f, offset, true)) {
+        uint8_t l;
+        while(storage_file_read(f, &l, 1) == 1 && l >= sizeof(HoneV2Header) &&
+              storage_file_read(f, buf, l) == l) {
+            mbedtls_sha256(buf, l, s->chain_head, 0);
+            s->chain_seq = ((const HoneV2Header*)buf)->counter;
+            if(!s->queue_first) s->queue_first = s->chain_seq;
+        }
     }
     storage_file_close(f);
     storage_file_free(f);
+    free(buf);
+}
+
+/* Boot: chain.bin + the queue tail after it. First boot with v3: the whole
+ * queue.bin (<= 4 MB) once, so the first v3 frame links to the last v2 one. */
+static void chain_load(HoneSrv* s) {
+    HoneChainState c;
+    if(read_file(s->storage, HONE_CHAIN_PATH, &c, sizeof(c)) && c.magic == HONE_CHAIN_MAGIC) {
+        memcpy(s->chain_head, c.head, 32);
+        s->chain_seq = c.seq;
+        s->queue_first = c.queue_first;
+        chain_replay(s, c.offset);
+    } else {
+        memset(s->chain_head, 0, 32);
+        s->chain_seq = 0;
+        s->queue_first = 0;
+        chain_replay(s, 0);
+    }
+    FileInfo fi;
+    uint32_t size = storage_common_stat(s->storage, HONE_QUEUE_PATH, &fi) == FSE_OK ? fi.size : 0;
+    chain_save(s, size);
+    FURI_LOG_I(TAG, "chain seq %lu, queue from %lu", s->chain_seq, s->queue_first);
+}
+
+static void queue_append(HoneSrv* s, const uint8_t* frame, size_t len, uint32_t seq) {
+    FileInfo fi;
+    if(storage_common_stat(s->storage, HONE_QUEUE_PATH, &fi) == FSE_OK &&
+       fi.size > HONE_QUEUE_MAX) {
+        /* Rotate. The name carries the seq range, so a delivered archive can be
+         * found without opening it. Archives are only ever deleted once a phone
+         * has acknowledged everything in them, and only when the SD runs low. */
+        char path[80];
+        storage_common_mkdir(s->storage, HONE_ARCHIVE_DIR);
+        snprintf(
+            path, sizeof(path), HONE_ARCHIVE_DIR "/q-%lu-%lu-%lu.bin",
+            (unsigned long)furi_hal_rtc_get_timestamp(), (unsigned long)s->queue_first,
+            (unsigned long)s->chain_seq);
+        if(storage_common_rename(s->storage, HONE_QUEUE_PATH, path) == FSE_OK) {
+            s->queue_first = seq;
+            chain_save(s, 0);
+        }
+    }
+    File* f = storage_file_alloc(s->storage);
+    uint32_t size = 0;
+    if(storage_file_open(f, HONE_QUEUE_PATH, FSAM_WRITE, FSOM_OPEN_APPEND)) {
+        uint8_t l = (uint8_t)len; /* frames are <= 240 bytes */
+        storage_file_write(f, &l, 1);
+        storage_file_write(f, frame, len);
+        size = (uint32_t)storage_file_size(f);
+    }
+    storage_file_close(f);
+    storage_file_free(f);
+    mbedtls_sha256(frame, len, s->chain_head, 0);
+    s->chain_seq = seq;
+    if(!s->queue_first) s->queue_first = seq;
+    if(++s->chain_unsaved >= HONE_CHAIN_SAVE_EVERY) chain_save(s, size);
+}
+
+/* ─── SD space: never drop undelivered data ───────────────────────────────
+ * Below HONE_SD_LOW_MB free, delete the oldest archive whose last seq a phone
+ * has acknowledged (ack.bin). Archives from before the v3 log (no seq range in
+ * the name) are never deleted. If nothing can be deleted and space keeps
+ * falling, economy mode: continuous Sub-GHz RSSI frames are thinned 1 in 4;
+ * every event (gadget, jam, tag, tracker...) is still logged. */
+static void sd_manage(HoneSrv* s) {
+    uint64_t total = 0, free_b = 0;
+    if(storage_common_fs_info(s->storage, STORAGE_EXT_PATH_PREFIX, &total, &free_b) != FSE_OK)
+        return;
+    uint32_t free_mb = (uint32_t)(free_b / (1024u * 1024u));
+    uint32_t ack = 0;
+    read_file(s->storage, HONE_ACK_PATH, &ack, sizeof(ack));
+
+    if(free_mb < HONE_SD_LOW_MB) {
+        File* d = storage_file_alloc(s->storage);
+        char name[64], best[64] = {0};
+        unsigned long best_last = 0xFFFFFFFFul;
+        FileInfo fi;
+        if(storage_dir_open(d, HONE_ARCHIVE_DIR)) {
+            while(storage_dir_read(d, &fi, name, sizeof(name))) {
+                unsigned long rtc, first, last;
+                if(sscanf(name, "q-%lu-%lu-%lu.bin", &rtc, &first, &last) == 3 && last <= ack &&
+                   last < best_last) {
+                    best_last = last;
+                    strlcpy(best, name, sizeof(best));
+                }
+            }
+        }
+        storage_dir_close(d);
+        storage_file_free(d);
+        if(best[0]) {
+            char path[96];
+            snprintf(path, sizeof(path), HONE_ARCHIVE_DIR "/%s", best);
+            if(storage_common_remove(s->storage, path) == FSE_OK)
+                FURI_LOG_W(TAG, "sd low (%lu MB): removed delivered %s", free_mb, best);
+        }
+    }
+    bool econ = free_mb < HONE_SD_ECON_MB;
+    if(econ && !s->economy) find_push(s, "SD almost full: sync a phone");
+    s->economy = econ;
+    ST_LOCK(s);
+    s->rec.st.sd_free_mb = free_mb;
+    s->rec.st.sd_economy = econ;
+    s->rec.st.acked_seq = ack;
+    ST_UNLOCK(s);
 }
 
 /* ─── sensors: each one acquires and fully releases its hardware ───────── */
 
-static bool capture_subghz(const HoneSrv* s, HoneBodySubGhz* out) {
+/* ─── Sub-GHz: RSSI windows + gadget census + jamming ─────────────────────
+ * Each window listens HONE_SLOT_MS on one band. On the OOK bands (433.92, 315,
+ * 868.35) the window also runs the firmware's own Sub-GHz decoders through
+ * async RX, when TIM2 is free and the heap allows. A decoded packet yields
+ * only: decoder name (brand/protocol family), static vs dynamic (fixed vs
+ * rolling code) and the decoder's 1-byte data hash, which never leaves RAM
+ * except as a daily-keyed HMAC token. No code, key or payload is kept. */
+
+#define HONE_GADGET_PER_WIN 8
+#define HONE_GADGET_RECENT  16
+#define HONE_GADGET_QUIET_MS (10u * 60u * 1000u) /* same device: one frame per 10 min */
+#define HONE_DECODE_MIN_HEAP (24u * 1024u)       /* largest free block needed to decode */
+
+typedef struct {
+    const SubGhzProtocol* proto;
+    uint8_t hash;
+    uint8_t count;
+} HoneHeard;
+
+typedef struct {
+    HoneHeard heard[HONE_GADGET_PER_WIN];
+    uint8_t n;
+    uint32_t acc;      /* ISR: glitch filter accumulator */
+} HoneDecodeWin;
+
+static FuriStreamBuffer* volatile sg_stream;
+
+static void sg_capture_cb(bool level, uint32_t duration, void* ctx) {
+    HoneDecodeWin* w = ctx;
+    if(duration < 30) { /* glitch: fold into the next pulse */
+        w->acc += duration;
+        return;
+    }
+    LevelDuration ld = level_duration_make(level, duration + w->acc);
+    w->acc = 0;
+    if(sg_stream) furi_stream_buffer_send(sg_stream, &ld, sizeof(ld), 0);
+}
+
+static void sg_decoded_cb(SubGhzReceiver* r, SubGhzProtocolDecoderBase* d, void* ctx) {
+    UNUSED(r);
+    HoneDecodeWin* w = ctx;
+    uint8_t h = subghz_protocol_decoder_base_get_hash_data(d);
+    for(uint8_t i = 0; i < w->n; i++) {
+        if(w->heard[i].proto == d->protocol && w->heard[i].hash == h) {
+            if(w->heard[i].count < 255) w->heard[i].count++;
+            return;
+        }
+    }
+    if(w->n < HONE_GADGET_PER_WIN) w->heard[w->n++] = (HoneHeard){d->protocol, h, 1};
+}
+
+static bool band_is_ook(uint32_t f) {
+    return f == 433920000UL || f == 315000000UL || f == 868350000UL;
+}
+
+/* One window. *band = index into hone_subghz_freqs; win->n > 0 if decoded. */
+static bool capture_subghz(HoneSrv* s, HoneBodySubGhz* out, uint8_t* band, HoneDecodeWin* win) {
     static size_t next = 0;
-    uint32_t freq = hone_subghz_freqs[next++ % COUNT_OF(hone_subghz_freqs)];
+    *band = (uint8_t)(next++ % COUNT_OF(hone_subghz_freqs));
+    uint32_t freq = hone_subghz_freqs[*band];
+    memset(win, 0, sizeof(*win));
     if(!furi_hal_subghz_is_frequency_valid(freq)) return false;
+
+    SubGhzEnvironment* env = NULL;
+    SubGhzReceiver* rx = NULL;
+    FuriStreamBuffer* sb = NULL;
+    bool decode = band_is_ook(freq) && memmgr_heap_get_max_free_block() >= HONE_DECODE_MIN_HEAP &&
+                  furi_mutex_acquire(s->tim_lock, 0) == FuriStatusOk;
+    if(decode) {
+        env = subghz_environment_alloc();
+        subghz_environment_set_protocol_registry(env, &subghz_protocol_registry);
+        rx = subghz_receiver_alloc_init(env);
+        subghz_receiver_set_filter(rx, SubGhzProtocolFlag_Decodable);
+        subghz_receiver_set_rx_callback(rx, sg_decoded_cb, win);
+        sb = furi_stream_buffer_alloc(512 * sizeof(LevelDuration), sizeof(LevelDuration));
+    }
 
     furi_hal_subghz_reset();
     furi_hal_subghz_idle();
+    if(decode) furi_hal_subghz_load_custom_preset(subghz_device_cc1101_preset_ook_650khz_async_regs);
     furi_hal_subghz_set_frequency_and_path(freq);
     furi_hal_subghz_flush_rx();
     furi_hal_subghz_rx();
+    if(decode) {
+        sg_stream = sb;
+        furi_hal_subghz_start_async_rx(sg_capture_cb, win);
+    }
     furi_delay_ms(3);
 
     float peak = -200.0f, sum = 0.0f;
     uint16_t n = 0;
-    uint32_t start = furi_get_tick();
+    uint32_t start = furi_get_tick(), last_rssi = 0;
     while(furi_get_tick() - start < furi_ms_to_ticks(HONE_SLOT_MS) && !hone_should_yield(s)) {
-        float r = furi_hal_subghz_get_rssi();
-        if(r > peak) peak = r;
-        sum += r;
-        n++;
-        furi_delay_ms(HONE_RSSI_GAP_MS);
+        if(decode) {
+            LevelDuration ld;
+            while(furi_stream_buffer_receive(sb, &ld, sizeof(ld), 0) == sizeof(ld))
+                subghz_receiver_decode(
+                    rx, level_duration_get_level(ld), level_duration_get_duration(ld));
+        }
+        if(!last_rssi || furi_get_tick() - last_rssi >= furi_ms_to_ticks(HONE_RSSI_GAP_MS)) {
+            last_rssi = furi_get_tick();
+            float r = furi_hal_subghz_get_rssi();
+            if(r > peak) peak = r;
+            sum += r;
+            n++;
+        }
+        furi_delay_ms(decode ? 10 : HONE_RSSI_GAP_MS);
     }
 
+    if(decode) {
+        furi_hal_subghz_stop_async_rx();
+        sg_stream = NULL;
+    }
     furi_hal_subghz_idle();
     furi_hal_subghz_sleep(); /* fully released before any signing */
+    if(decode) {
+        furi_mutex_release(s->tim_lock);
+        subghz_receiver_free(rx);
+        subghz_environment_free(env);
+        furi_stream_buffer_free(sb);
+    }
 
-    if(!n || hone_should_yield(s)) return false; /* cut short: not a full window */
+    if(!n || hone_should_yield(s)) {
+        win->n = 0;
+        return false; /* cut short: not a full window */
+    }
     out->freq_hz = freq;
     out->rssi_peak_dbm = (int8_t)CLAMP(peak, 0.0f, -128.0f);
     out->rssi_avg_dbm = (int8_t)CLAMP(sum / n, 0.0f, -128.0f);
@@ -967,6 +1269,73 @@ static int hexval(char c) {
 }
 
 /* "WIFI2 aps=N la=L best=R ch=c1,...,c13 probes=P uniq=U listen=S top=oid:rssi:ch,... ms=T" */
+/* hone-esp >= 0.3 adds to the WIFI2 line:
+ *   sec=open,wep,wpa,wpa2,wpa3,ent,wps   networks by security type
+ *   pso=<8hex>,...                        up to 32 probe senders as 4-byte keyed
+ *                                         oids (daily key; never a MAC)
+ *   cu=f1,f6,f11                          frames/s heard on channels 1, 6, 11
+ *   deauth=N                              deauth + disassoc frames heard
+ * Parsed into these (Wi-Fi lane only). */
+#define HONE_PSO_MAX 32
+static struct {
+    bool sec_ok, crowd_ok;
+    HoneBodyWifiSec sec;
+    uint32_t pso[HONE_PSO_MAX];
+    uint8_t pso_n;
+    uint16_t cu[3];
+    uint16_t deauth;
+} wx;
+
+static void csv_u16(const char* p, uint16_t* out, int n) {
+    for(int i = 0; i < n && *p && *p != ' '; i++) {
+        out[i] = (uint16_t)MIN(atoi(p), 0xFFFF);
+        while(*p && *p != ',' && *p != ' ') p++;
+        if(*p == ',') p++;
+    }
+}
+
+static void wifi_extra_parse(const char* line) {
+    memset(&wx, 0, sizeof(wx));
+    const char* p = strstr(line, " sec=");
+    if(p) {
+        uint16_t v[7] = {0};
+        csv_u16(p + 5, v, 7);
+        wx.sec = (HoneBodyWifiSec){
+            .ver = 1,
+            .open = (uint8_t)MIN(v[0], 255),
+            .wep = (uint8_t)MIN(v[1], 255),
+            .wpa = (uint8_t)MIN(v[2], 255),
+            .wpa2 = (uint8_t)MIN(v[3], 255),
+            .wpa3 = (uint8_t)MIN(v[4], 255),
+            .ent = (uint8_t)MIN(v[5], 255),
+            .wps = (uint8_t)MIN(v[6], 255),
+        };
+        wx.sec_ok = true;
+    }
+    p = strstr(line, " pso=");
+    if(p) {
+        wx.crowd_ok = true;
+        p += 5;
+        while(wx.pso_n < HONE_PSO_MAX && *p && *p != ' ' && *p != '-') {
+            uint32_t v = 0;
+            int i = 0;
+            for(; i < 8; i++) {
+                int h = hexval(p[i]);
+                if(h < 0) break;
+                v = v << 4 | (uint32_t)h;
+            }
+            if(i != 8) break;
+            wx.pso[wx.pso_n++] = v;
+            p += 8;
+            if(*p == ',') p++;
+        }
+    }
+    p = strstr(line, " cu=");
+    if(p) csv_u16(p + 4, wx.cu, 3);
+    int d = kv_int(line, " deauth=");
+    wx.deauth = (uint16_t)MIN(d < 0 ? 0 : d, 0xFFFF);
+}
+
 static bool wifi2_parse(const char* line, HoneBodyWifi2* out) {
     if(strncmp(line, "WIFI2 ", 6) != 0) return false;
     memset(out, 0, sizeof(*out));
@@ -1008,6 +1377,7 @@ static bool wifi2_parse(const char* line, HoneBodyWifi2* out) {
             if(*p == ',') p++;
         }
     }
+    wifi_extra_parse(line);
     return true;
 }
 
@@ -1046,14 +1416,14 @@ static bool capture_wifi(HoneSrv* s, HoneBodyWifi* v1, HoneBodyWifi2* v2, bool* 
     furi_hal_serial_init(h, HONE_WIFI_BAUD);
     furi_hal_serial_async_rx_start(h, wifi_rx_cb, sb, false);
 
-    char* line = malloc(400);
+    char* line = malloc(800); /* WIFI2 with sec/pso/cu fields runs to ~650 chars */
     bool alive = false, got = false, new_board = false;
     *is_v2 = false;
     uint32_t start = furi_get_tick();
     while(!alive && furi_get_tick() - start < furi_ms_to_ticks(HONE_WIFI_BOOT_MS) &&
           !hone_should_yield(s)) {
         furi_hal_serial_tx(h, (const uint8_t*)"PING\n", 5);
-        while(wifi_readline(sb, line, 400, 500)) {
+        while(wifi_readline(sb, line, 800, 500)) {
             if(strncmp(line, "PONG", 4) == 0) {
                 alive = true;
                 /* "PONG hone-esp 0.1.0": 0.1.x only speaks v1 */
@@ -1079,7 +1449,7 @@ static bool capture_wifi(HoneSrv* s, HoneBodyWifi* v1, HoneBodyWifi2* v2, bool* 
         bool keyed = false;
         start = furi_get_tick();
         while(!keyed && furi_get_tick() - start < furi_ms_to_ticks(1000)) {
-            if(wifi_readline(sb, line, 400, 200)) keyed = strncmp(line, "OK key", 6) == 0;
+            if(wifi_readline(sb, line, 800, 200)) keyed = strncmp(line, "OK key", 6) == 0;
         }
         if(keyed) {
             char sc[24];
@@ -1088,7 +1458,7 @@ static bool capture_wifi(HoneSrv* s, HoneBodyWifi* v1, HoneBodyWifi2* v2, bool* 
             start = furi_get_tick();
             while(!got && furi_get_tick() - start < furi_ms_to_ticks(HONE_WIFI2_SCAN_MS) &&
           !hone_should_yield(s)) {
-                if(wifi_readline(sb, line, 400, 500)) got = wifi2_parse(line, v2);
+                if(wifi_readline(sb, line, 800, 500)) got = wifi2_parse(line, v2);
             }
             *is_v2 = got;
         }
@@ -1098,10 +1468,11 @@ static bool capture_wifi(HoneSrv* s, HoneBodyWifi* v1, HoneBodyWifi2* v2, bool* 
         start = furi_get_tick();
         while(!got && furi_get_tick() - start < furi_ms_to_ticks(HONE_WIFI_SCAN_MS) &&
           !hone_should_yield(s)) {
-            if(wifi_readline(sb, line, 400, 500)) got = wifi_parse(line, v1);
+            if(wifi_readline(sb, line, 800, 500)) got = wifi_parse(line, v1);
         }
     }
     free(line);
+    s->wifi_board = alive;
 
     furi_hal_serial_async_rx_stop(h);
     furi_hal_serial_deinit(h);
@@ -1123,20 +1494,29 @@ static int group_of(HoneMsgType t) {
     case HoneMsgIr: return 3;
     case HoneMsgBleCrowd: return 4;
     case HoneMsgSighting: return 5;
+    /* new census frames ride in the existing on-chain sensor groups */
+    case HoneMsgGadget:
+    case HoneMsgJam: return 0;
+    case HoneMsgWifiSec:
+    case HoneMsgWifiCrowd: return 1;
+    case HoneMsgReader: return 2;
+    case HoneMsgBleThreat: return 4;
     default: return -1;
     }
 }
 
 static void emit(HoneSrv* s, HoneMsgType type, const void* body, uint8_t body_len) {
     furi_check(furi_mutex_acquire(s->emit_lock, FuriWaitForever) == FuriStatusOk);
+    uint32_t seq = counter_next(s);
     size_t len = hone_frame_build(
-        s->frame, type, body, body_len, s->pk, s->sk, counter_next(s), s->anchor);
+        s->frame, type, body, body_len, s->pk, s->sk, seq, s->anchor, s->chain_head);
     if(len) {
-        queue_append(s, s->frame, len);
+        queue_append(s, s->frame, len, seq);
         s->total_frames++;
         ST_LOCK(s);
         s->rec.st.frames = s->total_frames;
         s->rec.st.counter = s->counter;
+        s->rec.st.chain_seq = s->chain_seq;
         ST_UNLOCK(s);
         int g = group_of(type);
         if(g >= 0) {
@@ -1227,6 +1607,26 @@ static void ir_status(HoneSrv* s, const HoneBodyIr* b) {
     ST_UNLOCK(s);
 }
 
+/* A reader field: one frame per kind per 10 min while it stays around. */
+static bool reader_found(HoneSrv* s, uint8_t kind, uint32_t freq) {
+    static uint32_t last[3];
+    if(last[kind] && furi_get_tick() - last[kind] < furi_ms_to_ticks(10u * 60u * 1000u))
+        return true;
+    last[kind] = furi_get_tick() ? furi_get_tick() : 1;
+    HoneBodyReader b = {.ver = 1, .kind = kind, .freq_hz = freq};
+    emit(s, HoneMsgReader, &b, sizeof(b));
+    char t[48];
+    if(kind == HONE_READER_125K)
+        snprintf(t, sizeof(t), "125kHz reader %lu.%luk legacy", freq / 1000, freq / 100 % 10);
+    else
+        snprintf(t, sizeof(t), "NFC 13.56MHz reader nearby");
+    find_push(s, t);
+    ST_LOCK(s);
+    s->rec.st.readers++;
+    ST_UNLOCK(s);
+    return true;
+}
+
 /* Run one slot. Returns true if the sensor produced a reading. */
 static bool run_slot(HoneSrv* s, HoneSensorKind k) {
     switch(k) {
@@ -1293,9 +1693,120 @@ static bool run_slot(HoneSrv* s, HoneSensorKind k) {
         FURI_LOG_I(TAG, "ir proto %d addr %lx cmd %lx", b.protocol, b.address, b.command);
         return true;
     }
+    case HoneSensorReader: {
+        /* Card-reader census: is a reader's field around us? Field presence
+         * only: we never answer it, emulate a card or read anything. */
+        bool any = false;
+        if(furi_hal_nfc_acquire() == FuriHalNfcErrorNone) {
+            furi_hal_nfc_low_power_mode_stop();
+            furi_hal_nfc_field_detect_start();
+            bool hf = false;
+            for(int i = 0; i < 10 && !hf && !hone_should_yield(s); i++) {
+                furi_delay_ms(100);
+                hf = furi_hal_nfc_field_is_present();
+            }
+            furi_hal_nfc_field_detect_stop();
+            furi_hal_nfc_low_power_mode_start();
+            furi_hal_nfc_release();
+            if(hf) any |= reader_found(s, HONE_READER_NFC, 0);
+        }
+        furi_hal_rfid_field_detect_start();
+        uint32_t f = 0;
+        bool lf = false;
+        for(int i = 0; i < 10 && !lf && !hone_should_yield(s); i++) {
+            furi_delay_ms(100);
+            lf = furi_hal_rfid_field_is_present(&f);
+        }
+        furi_hal_rfid_field_detect_stop();
+        if(lf) any |= reader_found(s, HONE_READER_125K, f);
+        return any;
+    }
     default:
         return false;
     }
+}
+
+/* Turn a window's decodes into census frames: one per device per 10 min. */
+static void gadgets_emit(HoneSrv* s, const HoneDecodeWin* win, const HoneBodySubGhz* sg) {
+    static struct {
+        uint32_t token;
+        uint32_t tick;
+    } recent[HONE_GADGET_RECENT];
+    static uint8_t recent_next;
+    uint8_t kd[32];
+    for(uint8_t i = 0; i < win->n; i++) {
+        const SubGhzProtocol* p = win->heard[i].proto;
+        HoneBodyGadget g = {
+            .ver = 1,
+            .category = (uint8_t)hone_gadget_category(p->name),
+            .sec_class = (uint8_t)hone_gadget_security((int)p->type),
+            .freq_hz = sg->freq_hz,
+            .rssi_dbm = sg->rssi_peak_dbm,
+            .count = win->heard[i].count,
+        };
+        strncpy(g.protocol, p->name, sizeof(g.protocol));
+        /* token = HMAC(K_day, "hone-sg" || name || hash)[0..4]: links the same
+         * device within a day, nothing else; K_day never leaves RAM */
+        uint8_t mac[32], msg[1 + sizeof(g.protocol)];
+        memcpy(msg, g.protocol, sizeof(g.protocol));
+        msg[sizeof(g.protocol)] = win->heard[i].hash;
+        k_day_get(s, kd, NULL);
+        hmac_sha256(kd, 32, (const uint8_t*)"hone-sg", 7, msg, sizeof(msg), mac);
+        memcpy(g.token, mac, 4);
+        uint32_t tok;
+        memcpy(&tok, mac, 4);
+        bool fresh = true;
+        for(uint8_t k = 0; k < HONE_GADGET_RECENT; k++)
+            if(recent[k].tick && recent[k].token == tok &&
+               furi_get_tick() - recent[k].tick < furi_ms_to_ticks(HONE_GADGET_QUIET_MS))
+                fresh = false;
+        if(!fresh) continue;
+        recent[recent_next].token = tok;
+        recent[recent_next].tick = furi_get_tick() ? furi_get_tick() : 1;
+        recent_next = (recent_next + 1) % HONE_GADGET_RECENT;
+
+        emit(s, HoneMsgGadget, &g, sizeof(g));
+        char t[30];
+        snprintf(
+            t, sizeof(t), "%.10s %s %s", p->name,
+            hone_gadget_category_name((HoneGadgetCategory)g.category),
+            hone_sec_class_name((HoneSecClass)g.sec_class));
+        find_push(s, t);
+        ST_LOCK(s);
+        s->rec.st.gadgets++;
+        if(g.sec_class == HoneSecFixed) s->rec.st.gadgets_fixed++;
+        ST_UNLOCK(s);
+    }
+    memset(kd, 0, sizeof(kd));
+}
+
+static void jam_note(HoneSrv* s, uint8_t band, const HoneBodySubGhz* sg) {
+    static HoneJam jam = {.round_max = -128};
+    static uint32_t started_rtc, started_tick;
+    HoneJamEvent ev = hone_jam_feed(&jam, band, sg->rssi_avg_dbm, sg->rssi_peak_dbm);
+    if(ev == HoneJamNone) return;
+    HoneBodyJam b = {.ver = 1, .bands = jam.bands, .max_avg_dbm = jam.max_avg};
+    char l2[26];
+    if(ev == HoneJamStarted) {
+        started_rtc = furi_hal_rtc_get_timestamp();
+        started_tick = furi_get_tick();
+        b.flags = HONE_JAM_START;
+        b.started = started_rtc;
+        snprintf(l2, sizeof(l2), "%d dBm on %d bands", jam.max_avg, __builtin_popcount(jam.bands));
+        alert_raise(s, "Sub-GHz JAMMING?", l2);
+        find_push(s, "Sub-GHz jamming started");
+    } else {
+        b.flags = HONE_JAM_END;
+        b.started = started_rtc;
+        uint32_t d = (furi_get_tick() - started_tick) / furi_kernel_get_tick_frequency();
+        b.duration_s = (uint16_t)MIN(d, 0xFFFFu);
+        snprintf(l2, sizeof(l2), "jamming ended, %lus", (unsigned long)d);
+        find_push(s, l2);
+    }
+    emit(s, HoneMsgJam, &b, sizeof(b));
+    ST_LOCK(s);
+    s->rec.st.jamming = jam.jamming;
+    ST_UNLOCK(s);
 }
 
 /* ─── lanes ─────────────────────────────────────────────────────────────── */
@@ -1311,10 +1822,16 @@ static int32_t subghz_lane(void* ctx) {
             continue;
         }
         HoneBodySubGhz b;
-        bool got = capture_subghz(s, &b);
+        HoneDecodeWin win;
+        uint8_t band;
+        static uint8_t thin;
+        bool got = capture_subghz(s, &b, &band, &win);
         lane_leave(s, HoneLaneSubGhz); /* radio is asleep again */
         if(got) {
-            emit(s, HoneMsgSubGhz, &b, sizeof(b));
+            /* economy (SD full of undelivered data): keep 1 in 4 RSSI frames */
+            if(!s->economy || (thin++ & 3) == 0) emit(s, HoneMsgSubGhz, &b, sizeof(b));
+            gadgets_emit(s, &win, &b);
+            jam_note(s, band, &b);
             ST_LOCK(s);
             s->rec.st.subghz_freq = b.freq_hz;
             s->rec.st.subghz_peak = b.rssi_peak_dbm;
@@ -1329,9 +1846,121 @@ static int32_t subghz_lane(void* ctx) {
     return 0;
 }
 
+/* Wi-Fi presence: probe senders per window (keyed oids, counted only),
+ * channel load and deauth bursts. RAM only; sets reset with the window/day. */
+#define HONE_WCROWD_WIN 256u
+#define HONE_WCROWD_DAY 512u
+#define HONE_DEAUTH_ATTACK 30u /* deauth+disassoc frames in one ~15 s listen */
+
+typedef struct {
+    uint32_t window, day;
+    uint32_t* win;
+    uint16_t win_n;
+    uint16_t returning;
+    uint32_t* today;
+    uint16_t today_n;
+} HoneWifiCrowd;
+
+static bool set32_has(const uint32_t* set, uint16_t n, uint32_t v) {
+    for(uint16_t i = 0; i < n; i++)
+        if(set[i] == v) return true;
+    return false;
+}
+
+static void wifi_crowd_note(HoneSrv* s, HoneWifiCrowd* c) {
+    uint32_t utc = utc_now(s);
+    uint32_t window = utc / HONE_WINDOW_S, day = utc / 86400u;
+    if(!c->win) {
+        c->win = malloc(HONE_WCROWD_WIN * sizeof(uint32_t));
+        c->today = malloc(HONE_WCROWD_DAY * sizeof(uint32_t));
+    }
+    if(day != c->day) {
+        c->day = day;
+        c->today_n = 0; /* the board's oid key rotates with K_day */
+    }
+    if(window != c->window) {
+        for(uint16_t i = 0; i < c->win_n && c->today_n < HONE_WCROWD_DAY; i++)
+            if(!set32_has(c->today, c->today_n, c->win[i])) c->today[c->today_n++] = c->win[i];
+        c->window = window;
+        c->win_n = 0;
+        c->returning = 0;
+    }
+    for(uint8_t i = 0; i < wx.pso_n; i++) {
+        if(set32_has(c->win, c->win_n, wx.pso[i]) || c->win_n >= HONE_WCROWD_WIN) continue;
+        c->win[c->win_n++] = wx.pso[i];
+        if(set32_has(c->today, c->today_n, wx.pso[i])) c->returning++;
+    }
+    HoneBodyWifiCrowd b = {
+        .ver = 1,
+        .window = window,
+        .scan_devices = wx.pso_n,
+        .win_devices = c->win_n,
+        .returning = c->returning,
+        .deauth = wx.deauth,
+        .flags = wx.deauth >= HONE_DEAUTH_ATTACK ? HONE_WIFI_ATTACK : 0,
+    };
+    memcpy(b.cu, wx.cu, sizeof(b.cu));
+    emit(s, HoneMsgWifiCrowd, &b, sizeof(b));
+    static uint32_t attack_tick;
+    if((b.flags & HONE_WIFI_ATTACK) &&
+       (!attack_tick || furi_get_tick() - attack_tick > furi_ms_to_ticks(10u * 60u * 1000u))) {
+        attack_tick = furi_get_tick() ? furi_get_tick() : 1;
+        char l2[48];
+        snprintf(l2, sizeof(l2), "%u deauth frames / scan", wx.deauth);
+        alert_raise(s, "Wi-Fi deauth attack?", l2);
+        find_push(s, l2);
+    }
+}
+
+/* Remember where we are: a new "place" when the strongest APs share nothing
+ * with the last ones (tracker detection uses it; nothing is sent). */
+static void place_note(HoneSrv* s, const HoneBodyWifi2* b2) {
+    static uint32_t set[3];
+    static uint32_t place;
+    uint32_t now[3] = {0};
+    uint8_t n = MIN(b2->n_top, 3);
+    if(!n) return;
+    bool overlap = false;
+    for(uint8_t i = 0; i < n; i++) {
+        memcpy(&now[i], b2->top[i].oid, 4);
+        for(int k = 0; k < 3; k++) overlap |= set[k] && set[k] == now[i];
+    }
+    if(!place || !overlap) place++;
+    memcpy(set, now, sizeof(set));
+    s->loc_fp = place;
+}
+
+static void wifi_sec_note(HoneSrv* s) {
+    static HoneBodyWifiSec last;
+    emit(s, HoneMsgWifiSec, &wx.sec, sizeof(wx.sec));
+    if(wx.sec.open > last.open || wx.sec.wep > last.wep) {
+        char t[48];
+        snprintf(
+            t, sizeof(t), "Wi-Fi: %u open, %u WEP, %u WPS", wx.sec.open, wx.sec.wep, wx.sec.wps);
+        find_push(s, t);
+    }
+    last = wx.sec;
+    ST_LOCK(s);
+    s->rec.st.wifi_sec_ok = true;
+    s->rec.st.wifi_open = wx.sec.open;
+    s->rec.st.wifi_wep = wx.sec.wep;
+    s->rec.st.wifi_wpa = wx.sec.wpa;
+    s->rec.st.wifi_wpa2 = wx.sec.wpa2;
+    s->rec.st.wifi_wpa3 = wx.sec.wpa3;
+    s->rec.st.wifi_ent = wx.sec.ent;
+    s->rec.st.wifi_wps = wx.sec.wps;
+    ST_UNLOCK(s);
+}
+
+/* Board presence. On USB power the board's 5 V comes from VBUS, so probing is
+ * free: every minute. On battery an absent board is probed only at boot, when
+ * USB power arrives, or when the Hone screen opens (someone just plugged it
+ * in): no 5 V toggling for a board that is not there. */
 static int32_t wifi_lane(void* ctx) {
     HoneSrv* s = ctx;
     uint32_t last = 0;
+    bool was_ext = false;
+    HoneWifiCrowd crowd = {0};
     while(1) {
         if(hone_should_yield(s)) {
             furi_delay_ms(1000);
@@ -1340,18 +1969,31 @@ static int32_t wifi_lane(void* ctx) {
         /* Read VBUS while our 5 V output is off, so it reflects real external power. */
         if(!furi_hal_power_is_otg_enabled())
             s->ext_power = furi_hal_power_get_usb_voltage() > HONE_EXT_POWER_V;
-        /* one scan a minute on battery and on USB alike (spec 2b) */
-        if(last && furi_get_tick() - last < furi_ms_to_ticks(HONE_WIFI_EVERY_MS)) {
+        if(s->ext_power && !was_ext) s->wifi_reprobe = true;
+        if(s->rec.want_reprobe) {
+            s->rec.want_reprobe = false;
+            if(!s->wifi_board) s->wifi_reprobe = true;
+        }
+        was_ext = s->ext_power;
+        bool due = !last ||
+                   ((s->wifi_board || s->ext_power) &&
+                    furi_get_tick() - last >= furi_ms_to_ticks(HONE_WIFI_EVERY_MS)) ||
+                   s->wifi_reprobe;
+        if(!due) {
             furi_delay_ms(1000);
             continue;
         }
         if(!lane_enter(s, HoneLaneWifi)) continue;
+        s->wifi_reprobe = false;
         last = furi_get_tick();
         HoneBodyWifi b;
         HoneBodyWifi2 b2;
         bool v2;
+        bool had = s->wifi_board;
         bool got = capture_wifi(s, &b, &b2, &v2);
         lane_leave(s, HoneLaneWifi); /* USART released, 5 V back as it was */
+        if(s->wifi_board != had)
+            find_push(s, s->wifi_board ? "Wi-Fi board attached" : "Wi-Fi board gone");
         if(got) {
             s->wifi_ok_tick = furi_get_tick();
             ST_LOCK(s);
@@ -1364,6 +2006,9 @@ static int32_t wifi_lane(void* ctx) {
                 FURI_LOG_I(
                     TAG, "wifi2 aps %u la %u top %u probes %u senders %u",
                     b2.aps, b2.la_aps, b2.n_top, b2.probes, b2.probe_senders);
+                place_note(s, &b2);
+                if(wx.sec_ok) wifi_sec_note(s);
+                if(wx.crowd_ok) wifi_crowd_note(s, &crowd);
             } else {
                 emit(s, HoneMsgWifi, &b, sizeof(b));
                 FURI_LOG_I(TAG, "wifi aps %u best %d probes %u", b.aps, b.best_rssi, b.probes);
@@ -1416,7 +2061,93 @@ typedef struct {
     uint64_t* scan_set;
     uint16_t scan_n;
     HoneBodyBleCrowd crowd;
+    /* tracker tags (Find My, Tile, SmartTag, Chipolo, Google): RAM only; the
+     * key is the day-keyed oid, so the table is meaningless after midnight */
+    struct {
+        uint32_t tok;
+        uint32_t first, last; /* ticks */
+        uint32_t win_last;    /* last window it was heard in */
+        uint32_t place[2];    /* distinct places (Wi-Fi fingerprints) it was heard at */
+        uint8_t kind, wins, nplace;
+        bool alerted;
+    } trk[24];
+    uint8_t trk_n;
+    uint8_t win_trk[HoneTrackerKinds];
+    uint8_t win_following;
+    uint8_t win_skim;
+    uint32_t skim_tick;
 } HoneBle;
+
+#define HONE_FOLLOW_WINDOWS 3                    /* heard in 3+ quarter-hours */
+#define HONE_FOLLOW_SPAN_MS (45u * 60u * 1000u)  /* over 45+ minutes */
+#define HONE_FOLLOW_SPAN_NOWIFI_MS (90u * 60u * 1000u)
+
+static void tracker_seen(HoneBle* b, HoneTrackerKind k, uint32_t tok) {
+    uint32_t now = furi_get_tick();
+    uint32_t place = b->s->loc_fp;
+    int e = -1, oldest = 0;
+    for(int i = 0; i < b->trk_n; i++) {
+        if(b->trk[i].tok == tok && b->trk[i].kind == k) e = i;
+        if(b->trk[i].last < b->trk[oldest].last) oldest = i;
+    }
+    if(e < 0) {
+        e = (size_t)b->trk_n < COUNT_OF(b->trk) ? b->trk_n++ : oldest;
+        memset(&b->trk[e], 0, sizeof(b->trk[e]));
+        b->trk[e].tok = tok;
+        b->trk[e].kind = (uint8_t)k;
+        b->trk[e].first = now;
+        ST_LOCK(b->s);
+        b->s->rec.st.trackers++;
+        ST_UNLOCK(b->s);
+    }
+    typeof(b->trk[0])* t = &b->trk[e];
+    t->last = now;
+    if(t->win_last != b->window) {
+        t->win_last = b->window;
+        if(t->wins < 255) t->wins++;
+        if(b->win_trk[k] < 255) b->win_trk[k]++;
+    }
+    if(place && t->nplace < 2 && (t->nplace == 0 || t->place[0] != place))
+        t->place[t->nplace++] = place;
+    uint32_t span = now - t->first;
+    bool follows = t->wins >= HONE_FOLLOW_WINDOWS &&
+                   ((span >= furi_ms_to_ticks(HONE_FOLLOW_SPAN_MS) && t->nplace >= 2) ||
+                    (!place && span >= furi_ms_to_ticks(HONE_FOLLOW_SPAN_NOWIFI_MS)));
+    if(follows && !t->alerted) {
+        t->alerted = true;
+        if(b->win_following < 255) b->win_following++;
+        char l2[26];
+        snprintf(
+            l2, sizeof(l2), "%s %ux, %lu min", hone_tracker_name(k), t->wins,
+            (unsigned long)(span / furi_kernel_get_tick_frequency() / 60));
+        alert_raise(b->s, "Tracker following you?", l2);
+        find_push(b->s, l2);
+        ST_LOCK(b->s);
+        b->s->rec.st.following++;
+        ST_UNLOCK(b->s);
+    }
+}
+
+/* Trackers and skimmer-module names in one advertising report. */
+static void ble_threats(HoneBle* b, const GapObserverReport* r, uint64_t oid) {
+    HoneTrackerKind k = hone_ble_tracker_kind(r->data, r->data_len);
+    if(k < HoneTrackerKinds) tracker_seen(b, k, (uint32_t)(oid >> 32));
+    char name[16];
+    if(hone_ble_skimmer_name(r->data, r->data_len, name, sizeof(name))) {
+        if(b->win_skim < 255) b->win_skim++;
+        /* close (a pump's card reader is an arm's length away) and not
+         * repeated more than every 10 min */
+        if(r->rssi != 127 && r->rssi >= -75 &&
+           (!b->skim_tick ||
+            furi_get_tick() - b->skim_tick > furi_ms_to_ticks(10u * 60u * 1000u))) {
+            b->skim_tick = furi_get_tick() ? furi_get_tick() : 1;
+            char l2[26];
+            snprintf(l2, sizeof(l2), "\"%.10s\" %d dBm", name, r->rssi);
+            alert_raise(b->s, "Skimmer module nearby?", l2);
+            find_push(b->s, l2);
+        }
+    }
+}
 
 static void ble_report_cb(const GapObserverReport* r, void* ctx) {
     HoneBle* b = ctx;
@@ -1527,6 +2258,7 @@ static void ble_take(HoneBle* b, const GapObserverReport* r, const uint8_t k_day
     memset(d, 0, sizeof(d));
     ble_hone_parse(b, r);
     if(!set64_add(b->scan_set, &b->scan_n, HONE_BLE_SCAN_SET, oid)) return; /* scan response etc. */
+    ble_threats(b, r, oid);
     if(r->addr_type & 1) b->crowd.random_addr++;
     if(r->rssi != 127) {
         int8_t v = r->rssi;
@@ -1580,9 +2312,26 @@ static void ble_close_window(HoneBle* b, uint32_t day) {
         }
         if(b->sight_n) FURI_LOG_I(TAG, "sightings w%lu: %u", b->window, b->sight_n);
     }
+    /* trackers / skimmer names this window: counts only */
+    bool threats = b->win_following || b->win_skim;
+    for(int k = 0; k < HoneTrackerKinds; k++) threats |= b->win_trk[k] != 0;
+    if(b->window && threats) {
+        HoneBodyBleThreat t = {
+            .ver = 1,
+            .window = b->window,
+            .following = b->win_following,
+            .skimmer_names = b->win_skim,
+        };
+        memcpy(t.trackers, b->win_trk, sizeof(t.trackers));
+        emit(b->s, HoneMsgBleThreat, &t, sizeof(t));
+    }
+    memset(b->win_trk, 0, sizeof(b->win_trk));
+    b->win_following = 0;
+    b->win_skim = 0;
     if(day != b->day) {
         b->day = day;
         b->day_n = 0; /* new K_day: yesterday's oids mean nothing now */
+        b->trk_n = 0; /* tracker tokens are day-keyed too */
     } else {
         for(uint16_t i = 0; i < b->win_n && b->day_n < HONE_BLE_DAY_SET; i++) {
             uint32_t fp = (uint32_t)b->win_set[i];
@@ -1702,8 +2451,8 @@ static size_t build_announce(HoneSrv* s, uint8_t* out) {
     };
     memcpy(b.pubkey, s->pk, 32);
     memcpy(b.owner, s->owner, sizeof(b.owner));
-    if(s->wifi_ok_tick && furi_get_tick() - s->wifi_ok_tick < furi_ms_to_ticks(5 * 60000))
-        b.caps |= HONE_CAP_WIFI;
+    if(s->wifi_board) b.caps |= HONE_CAP_WIFI; /* board attached (last probe) */
+    b.caps |= HONE_CAP_BLE | HONE_CAP_READERS;
     if(s->observer_ok) b.caps |= HONE_CAP_BLE_OBS;
     if(s->seed_ok) b.caps |= HONE_CAP_RID;
     if(s->ext_power) b.flags |= HONE_FLAG_EXT_POWER;
@@ -1712,7 +2461,7 @@ static size_t build_announce(HoneSrv* s, uint8_t* out) {
     furi_check(furi_mutex_acquire(s->emit_lock, FuriWaitForever) == FuriStatusOk);
     b.last_counter = s->counter ? s->counter - 1 : 0;
     size_t len = hone_frame_build(
-        out, HoneMsgAnnounce, &b, sizeof(b), s->pk, s->sk, counter_next(s), s->anchor);
+        out, HoneMsgAnnounce, &b, sizeof(b), s->pk, s->sk, counter_next(s), s->anchor, NULL);
     furi_mutex_release(s->emit_lock);
     return len;
 }
@@ -1779,6 +2528,40 @@ static void id_slot(HoneSrv* s, HoneWindowKey* key, const GapExtraBeaconConfig* 
     furi_hal_bt_extra_beacon_set_config(home);
 }
 
+/* Signed chain head ('HH' beacon, 96 bytes): devid8 | seq | rtc | head16 | sig,
+ * sig = ed25519 over "HH1" | devid8 | seq | rtc | head16. A phone that later
+ * gets the frames recomputes the chain and checks it ends in this head; the
+ * head is out in the air (and in heads.bin) from the moment it was signed, so
+ * frames cannot be backdated or swapped after the fact. Re-signs only when the
+ * log has moved; otherwise keeps the last one (returns its length). */
+static size_t build_head(HoneSrv* s, uint8_t* out, size_t have) {
+    static uint32_t signed_seq;
+    uint8_t head[16];
+    furi_check(furi_mutex_acquire(s->emit_lock, FuriWaitForever) == FuriStatusOk);
+    uint32_t seq = s->chain_seq;
+    memcpy(head, s->chain_head, 16);
+    furi_mutex_release(s->emit_lock);
+    if(!seq || (have && seq == signed_seq)) return have;
+    uint32_t rtc = furi_hal_rtc_get_timestamp();
+    uint8_t msg[3 + 8 + 4 + 4 + 16];
+    memcpy(msg, "HH1", 3);
+    memcpy(msg + 3, s->pk, 8);
+    memcpy(msg + 11, &seq, 4);
+    memcpy(msg + 15, &rtc, 4);
+    memcpy(msg + 19, head, 16);
+    memcpy(out, msg + 3, 32);
+    hone_ed25519_sign(out + 32, msg, sizeof(msg), s->sk);
+    signed_seq = seq;
+    HoneHeadRec r = {.seq = seq, .rtc = rtc};
+    memcpy(r.head, head, 16);
+    memcpy(r.sig, out + 32, 64);
+    File* f = storage_file_alloc(s->storage);
+    if(storage_file_open(f, HONE_HEADS_PATH, FSAM_WRITE, FSOM_OPEN_APPEND))
+        storage_file_write(f, &r, sizeof(r));
+    storage_file_close(f);
+    storage_file_free(f);
+    return 96;
+}
 static int32_t announce_lane(void* ctx) {
     HoneSrv* s = ctx;
     furi_record_open(RECORD_BT); /* blocks until the BT service is up */
@@ -1807,6 +2590,9 @@ static int32_t announce_lane(void* ctx) {
     uint8_t rr = 0;
     bool started = false;
     HoneWindowKey idkey = {0};
+    uint8_t hh[8 + 4 + 4 + 16 + 64]; /* devid | seq | rtc | head16 | sig */
+    size_t hh_len = 0;
+    uint32_t hh_tick = 0;
     while(1) {
         if(s->beacon_hold) {
             if(started) furi_hal_bt_extra_beacon_stop();
@@ -1830,6 +2616,12 @@ static int32_t announce_lane(void* ctx) {
             seq++;
         }
         send_fragments(s, adv, 'A', seq, frame, len, &started);
+        /* signed chain head ('HH'), re-signed when the log moved (<= every 30 s) */
+        if(!hh_len || furi_get_tick() - hh_tick > furi_ms_to_ticks(HONE_ANNOUNCE_EVERY_MS)) {
+            hh_tick = furi_get_tick();
+            hh_len = build_head(s, hh, hh_len);
+        }
+        if(hh_len) send_fragments(s, adv, 'H', hh[8], hh, hh_len, &started);
         batches_flush(s);
         /* One commit per cycle, round-robin, so the announce (which receivers need
          * first) keeps most of the airtime. */
@@ -1873,6 +2665,7 @@ int32_t hone_srv(void* p) {
     memset(s, 0, sizeof(HoneSrv));
     s->rec.lock = furi_mutex_alloc(FuriMutexTypeNormal);
     s->otg_lock = furi_mutex_alloc(FuriMutexTypeNormal);
+    s->tim_lock = furi_mutex_alloc(FuriMutexTypeNormal);
     strlcpy(s->rec.st.fw, HONE_FW_VERSION, sizeof(s->rec.st.fw));
     strlcpy(s->rec.st.boot_reason, "(waiting for SD card)", sizeof(s->rec.st.boot_reason));
     furi_record_create(RECORD_HONE, &s->rec);
@@ -1895,6 +2688,7 @@ int32_t hone_srv(void* p) {
 
     identity_load_or_create(s);
     counter_load(s);
+    chain_load(s); /* before any lane can emit */
     read_file(s->storage, HONE_ANCHOR_PATH, s->anchor, HONE_ANCHOR_LEN);
     owner_load(s);
     s->seed_lock = furi_mutex_alloc(FuriMutexTypeNormal);
@@ -1929,8 +2723,10 @@ int32_t hone_srv(void* p) {
     uint32_t autostart_tick = furi_get_tick();
 
     static const char* const sensor_name[HoneSensorCount] =
-        {"Sub-GHz", "NFC", "RFID", "iButton", "IR", "Wi-Fi", "heartbt"};
+        {"Sub-GHz", "NFC", "RFID", "iButton", "IR", "Wi-Fi", "heartbt", "readers"};
     uint32_t last_maint_check = furi_get_tick();
+    uint32_t last_sd_check = 0;
+    s->notif = furi_record_open(RECORD_NOTIFICATION);
     bool shown_yield = false;
     while(1) {
         if(furi_get_tick() - last_maint_check > furi_ms_to_ticks(5000)) {
@@ -1959,6 +2755,15 @@ int32_t hone_srv(void* p) {
                loader_start(loader, "Hone", NULL, NULL) == LoaderStatusOk)
                 autostart_left = 0;
         }
+        if(!last_sd_check || furi_get_tick() - last_sd_check > furi_ms_to_ticks(5u * 60u * 1000u)) {
+            sd_manage(s);
+            last_sd_check = furi_get_tick();
+        }
+        /* an alert wants the owner's eyes: open the Hone screen if nothing else runs */
+        if(s->want_screen) {
+            s->want_screen = false;
+            if(!loader_is_locked(loader)) loader_start(loader, "Hone", NULL, NULL);
+        }
         bool yield = hone_should_yield(s);
         if(yield != shown_yield) {
             shown_yield = yield;
@@ -1981,7 +2786,11 @@ int32_t hone_srv(void* p) {
         }
         if(!lane_enter(s, HoneLaneTag)) continue;
         status_tag_lane(s, sensor_name[k]);
+        /* tag sensors share TIM2 with Sub-GHz decoding; heartbeat needs no timer */
+        bool timed = k != HoneSensorHeartbeat;
+        if(timed) furi_check(furi_mutex_acquire(s->tim_lock, FuriWaitForever) == FuriStatusOk);
         bool found = run_slot(s, k);
+        if(timed) furi_mutex_release(s->tim_lock);
         lane_leave(s, HoneLaneTag); /* NFC/RFID/iButton/IR all released */
         status_tag_lane(s, "");
         hone_sched_report(&s->sched, k, found);

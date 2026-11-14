@@ -15,7 +15,7 @@
 #include <datetime/datetime.h>
 #include "kiskadee_sprites.h"
 
-#define HONE_PAGES 4
+#define HONE_PAGES 5
 
 typedef struct {
     HoneStatusRecord* rec;
@@ -29,6 +29,7 @@ typedef struct {
     uint32_t anim;
     HoneStatus prev;
     bool have_prev;
+    uint32_t alert_seen; /* alert_seq the owner dismissed */
     char say[24];
 } HoneApp;
 
@@ -79,7 +80,9 @@ static void mood_update(HoneApp* app) {
     uint32_t now = furi_get_tick();
     if(app->have_prev) {
         char what[24] = {0};
-        if(st->last_tag_tick != pv->last_tag_tick && st->last_tag[0]) {
+        if(st->find_seq != pv->find_seq && st->finds[0][0]) {
+            strlcpy(what, st->finds[0], sizeof(what));
+        } else if(st->last_tag_tick != pv->last_tag_tick && st->last_tag[0]) {
             strlcpy(what, st->last_tag, sizeof(what));
         } else if(
             st->wifi_tick != pv->wifi_tick && pv->wifi_tick && st->wifi_aps > pv->wifi_aps) {
@@ -190,6 +193,49 @@ static void draw_kiskadee(Canvas* canvas, HoneApp* app) {
     canvas_draw_str(canvas, x, 63, l);
 }
 
+
+/* ─── finds page + alert overlay ───────────────────────────────────────── */
+
+static void draw_finds(Canvas* canvas, HoneApp* app) {
+    const HoneStatus* st = &app->st;
+    char l[64], a[12];
+    int y = 19;
+    if(!st->finds[0][0]) {
+        canvas_draw_str(canvas, 0, y, "nothing new yet");
+        y += 9;
+    }
+    for(int i = 0; i < 4 && st->finds[i][0]; i++, y += 9) {
+        fmt_ago(a, sizeof(a), st->find_tick[i]);
+        canvas_draw_str(canvas, 0, y, st->finds[i]);
+        canvas_draw_str_aligned(canvas, 127, y, AlignRight, AlignBottom, a);
+    }
+    y = 55;
+    snprintf(
+        l, sizeof(l), "gadgets %u (%u fixed) rdr %u tag %u", st->gadgets, st->gadgets_fixed,
+        st->readers, st->trackers);
+    canvas_draw_str(canvas, 0, y, l);
+    snprintf(
+        l, sizeof(l), "log #%lu sent #%lu SD %luMB%s", (unsigned long)st->chain_seq,
+        (unsigned long)st->acked_seq, (unsigned long)st->sd_free_mb, st->sd_economy ? "!" : "");
+    canvas_draw_str(canvas, 0, 64, l);
+}
+
+static void draw_alert(Canvas* canvas, HoneApp* app) {
+    const HoneStatus* st = &app->st;
+    if(!st->alert_seq || st->alert_seq == app->alert_seen) return;
+    if(furi_get_tick() - st->alert_tick > furi_ms_to_ticks(10u * 60u * 1000u)) return;
+    canvas_set_color(canvas, ColorWhite);
+    canvas_draw_box(canvas, 4, 14, 120, 44);
+    canvas_set_color(canvas, ColorBlack);
+    canvas_draw_rframe(canvas, 4, 14, 120, 44, 3);
+    canvas_draw_rframe(canvas, 5, 15, 118, 42, 3);
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, 64, 26, AlignCenter, AlignBottom, st->alert[0]);
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignBottom, st->alert[1]);
+    canvas_draw_str_aligned(canvas, 64, 52, AlignCenter, AlignBottom, "OK: got it");
+}
+
 static void draw_cb(Canvas* canvas, void* ctx) {
     HoneApp* app = ctx;
     furi_check(furi_mutex_acquire(app->lock, FuriWaitForever) == FuriStatusOk);
@@ -201,13 +247,13 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str(canvas, 0, 9, "HONE");
     canvas_set_font(canvas, FontSecondary);
-    static const char* const titles[HONE_PAGES] = {"kiskadee", "status", "readings", "reboot"};
+    static const char* const titles[HONE_PAGES] = {"kiskadee", "finds", "status", "readings", "reboot"};
     canvas_draw_str(canvas, 30, 9, titles[app->page]);
     for(uint8_t i = 0; i < HONE_PAGES; i++) {
         if(i == app->page)
-            canvas_draw_box(canvas, 104 + i * 6, 4, 4, 4);
+            canvas_draw_box(canvas, 98 + i * 6, 4, 4, 4);
         else
-            canvas_draw_frame(canvas, 104 + i * 6, 4, 4, 4);
+            canvas_draw_frame(canvas, 98 + i * 6, 4, 4, 4);
     }
     canvas_draw_line(canvas, 0, 10, 127, 10);
 
@@ -216,6 +262,8 @@ static void draw_cb(Canvas* canvas, void* ctx) {
     if(app->page == 0) {
         draw_kiskadee(canvas, app);
     } else if(app->page == 1) {
+        draw_finds(canvas, app);
+    } else if(app->page == 2) {
         snprintf(
             l, sizeof(l), "Service: %s",
             st->paused   ? "PAUSED (maint.)" :
@@ -243,7 +291,7 @@ static void draw_cb(Canvas* canvas, void* ctx) {
             l, sizeof(l), "frames %lu  commits %lu", (unsigned long)st->frames,
             (unsigned long)st->commits);
         canvas_draw_str(canvas, 0, y, l);
-    } else if(app->page == 2) {
+    } else if(app->page == 3) {
         fmt_ago(a, sizeof(a), st->subghz_tick);
         snprintf(
             l, sizeof(l), "SubG %lu.%02lu %ddBm", (unsigned long)(st->subghz_freq / 1000000),
@@ -301,6 +349,7 @@ static void draw_cb(Canvas* canvas, void* ctx) {
         y += dy;
         canvas_draw_str(canvas, 0, y, "  boot.log");
     }
+    draw_alert(canvas, app);
     furi_mutex_release(app->lock);
 }
 
@@ -342,7 +391,9 @@ int32_t hone_app(void* p) {
             if(ev.type == InputTypeShort || ev.type == InputTypeRepeat) {
                 furi_check(furi_mutex_acquire(app->lock, FuriWaitForever) == FuriStatusOk);
                 if(ev.key == InputKeyBack) run = false;
-                if(ev.key == InputKeyRight || ev.key == InputKeyOk || ev.key == InputKeyDown)
+                if(ev.key == InputKeyOk && app->st.alert_seq != app->alert_seen) {
+                    app->alert_seen = app->st.alert_seq;
+                } else if(ev.key == InputKeyRight || ev.key == InputKeyOk || ev.key == InputKeyDown)
                     app->page = (app->page + 1) % HONE_PAGES;
                 if(ev.key == InputKeyLeft || ev.key == InputKeyUp)
                     app->page = (app->page + HONE_PAGES - 1) % HONE_PAGES;

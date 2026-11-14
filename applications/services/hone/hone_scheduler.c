@@ -23,6 +23,7 @@ static HoneSensorClass class_of(HoneSensorKind k) {
     case HoneSensorIr:        return HoneClassEvent;
     case HoneSensorWifi:      return HoneClassContinuous;
     case HoneSensorHeartbeat: return HoneClassHousekeeping;
+    case HoneSensorReader:    return HoneClassEvent;
     default:                   return HoneClassContinuous;
     }
 }

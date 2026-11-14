@@ -38,6 +38,7 @@ typedef enum {
     HoneSensorIr,         /* event: infrared remote signal             */
     HoneSensorWifi,       /* continuous: Wi-Fi dev board scan          */
     HoneSensorHeartbeat,  /* housekeeping: battery/uptime              */
+    HoneSensorReader,     /* event: card-reader field nearby (NFC/125k) */
     HoneSensorCount,
 } HoneSensorKind;
 

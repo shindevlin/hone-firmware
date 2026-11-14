@@ -46,6 +46,31 @@ typedef struct {
     uint8_t announce_seq;
     uint32_t announce_tick;
     uint32_t commits;
+    /* finds: newest first. find_seq bumps on every new find (the kiskadee
+     * shows "found"). Text is type/class only, never a code. */
+#define HONE_FINDS 6
+    char finds[HONE_FINDS][30];
+    uint32_t find_tick[HONE_FINDS];
+    uint32_t find_seq;
+    /* alert (tracker following, jamming, skimmer module): shown over any page */
+    char alert[2][26];
+    uint32_t alert_seq;
+    uint32_t alert_tick;
+    /* census counters since boot */
+    uint16_t gadgets;      /* distinct Sub-GHz gadgets */
+    uint16_t gadgets_fixed;
+    uint16_t readers;
+    uint16_t trackers;     /* distinct tracker tags today */
+    uint8_t following;
+    bool jamming;
+    /* Wi-Fi security (last scan, hone-esp >= 0.3) */
+    bool wifi_sec_ok;
+    uint8_t wifi_open, wifi_wep, wifi_wpa, wifi_wpa2, wifi_wpa3, wifi_ent, wifi_wps;
+    /* capture log */
+    uint32_t chain_seq;    /* newest chained frame */
+    uint32_t acked_seq;    /* delivered to a phone (ack.bin) */
+    uint32_t sd_free_mb;
+    bool sd_economy;       /* SD nearly full of undelivered data */
     /* last reboot (read once at boot) */
     char boot_reason[40];
     uint32_t boot_rtc;     /* local RTC time of this boot */
